@@ -131,7 +131,12 @@ class AIMEViewModel: ObservableObject {
     @Published var frameRate: String = "90"
 
     // Mask — stored as pixel radii from image center (in image space)
-    @Published var maskEnabled: Bool = true  // whether to include mask in generated .aime
+    enum MaskMode: String, CaseIterable {
+        case offMaxFOV = "Off (Max FOV)"
+        case offCompatible = "Off (Compatible)"
+        case custom = "Custom"
+    }
+    @Published var maskMode: MaskMode = .custom
     @Published var maskEdgeWidth: String = "2.5"
     @Published var maskNumPoints: String = "64"
     @Published var maskPlaneAngle: String = "10.0"
@@ -365,6 +370,7 @@ class AIMEViewModel: ObservableObject {
         var maskRadii: [Float]?  // legacy per-point multipliers
         var maskNumPoints: String?
         var maskPixelRadii: [Float]?
+        var maskMode: String?
         var videoPath: String?
         var swapEyes: Bool?
     }
@@ -381,6 +387,7 @@ class AIMEViewModel: ObservableObject {
             maskEdgeWidth: maskEdgeWidth,
             maskPlaneAngle: maskPlaneAngle, maskEdgeTreatment: maskEdgeTreatment,
             maskNumPoints: maskNumPoints, maskPixelRadii: maskPixelRadii,
+            maskMode: maskMode.rawValue,
             videoPath: videoURL?.path, swapEyes: swapEyes
         )
     }
@@ -400,6 +407,7 @@ class AIMEViewModel: ObservableObject {
         if let et = p.maskEdgeTreatment { maskEdgeTreatment = et }
         if let np = p.maskNumPoints { maskNumPoints = np }
         if let pr = p.maskPixelRadii { maskPixelRadii = pr }
+        if let mm = p.maskMode, let mode = MaskMode(rawValue: mm) { maskMode = mode }
         if let se = p.swapEyes { swapEyes = se }
         statusMessage = "Project loaded"
     }
@@ -825,22 +833,26 @@ class AIMEViewModel: ObservableObject {
             // Build .aime
             let meshCal = ImmersiveCameraMeshCalibration(name: calibrationName + "-mesh", usdzData: usdzData)
 
-            // Generate mask if enabled
+            // Generate mask based on mode
             let maskOption: ImmersiveCameraMask?
-            if maskEnabled {
-                let controlPoints = maskPixelRadiiToControlPoints()
-                let dynamicMask = ImmersiveDynamicMask(
-                    name: calibrationName + "-mask",
-                    stereoRelation: .separate,
-                    edgeTreatment: maskEdgeTreatment == "easeInOut" ? .easeInOut : .linear,
-                    controlPointInterpolation: .cubicHermite,
-                    leftControlPoints: controlPoints,
-                    rightControlPoints: controlPoints,
-                    edgeWidthInDegrees: maskEdgeV
-                )
-                maskOption = .dynamic(dynamicMask)
-            } else {
-                // Mask disabled — use a wide-FOV dynamic mask that covers everything
+            switch maskMode {
+            case .offMaxFOV:
+                // Transparent PNG image mask — maximum FOV, no masking at all
+                // Works on Vision Pro but may not work in Immersive Utility
+                let width = 8640, height = 4320
+                let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                            colorSpaceName: .deviceRGB, bytesPerRow: width * 4, bitsPerPixel: 32)!
+                let ptr = rep.bitmapData!
+                for px in 0..<(width * height) {
+                    ptr[px * 4] = 255; ptr[px * 4 + 1] = 255; ptr[px * 4 + 2] = 255; ptr[px * 4 + 3] = 0
+                }
+                let pngData = rep.representation(using: .png, properties: [:])!
+                let imgMask = ImmersiveImageMask(name: "no_mask", maskData: pngData)
+                maskOption = .image(imgMask)
+
+            case .offCompatible:
+                // Wide-FOV dynamic mask that covers everything — works in Immersive Utility too
                 let fullPts = (0..<64).map { i -> Point3DFloat in
                     let angle = Float.pi - Float(i) / 64.0 * 2.0 * .pi
                     return Point3DFloat(x: 1.0 * cos(angle), y: 1.0 * sin(angle), z: 0.135716)
@@ -852,9 +864,23 @@ class AIMEViewModel: ObservableObject {
                     controlPointInterpolation: .cubicHermite,
                     leftControlPoints: fullPts,
                     rightControlPoints: fullPts,
-                    edgeWidthInDegrees: 0
+                    edgeWidthInDegrees: 2.5
                 )
                 maskOption = .dynamic(fullMask)
+
+            case .custom:
+                // User-adjustable per-point mask
+                let controlPoints = maskPixelRadiiToControlPoints()
+                let dynamicMask = ImmersiveDynamicMask(
+                    name: calibrationName + "-mask",
+                    stereoRelation: .separate,
+                    edgeTreatment: maskEdgeTreatment == "easeInOut" ? .easeInOut : .linear,
+                    controlPointInterpolation: .cubicHermite,
+                    leftControlPoints: controlPoints,
+                    rightControlPoints: controlPoints,
+                    edgeWidthInDegrees: maskEdgeV
+                )
+                maskOption = .dynamic(dynamicMask)
             }
 
             let calibration = ImmersiveCameraCalibration(
@@ -1268,7 +1294,7 @@ class AIMEViewModel: ObservableObject {
 
     /// Hash of all preview-affecting parameters — used by .onChange to trigger rebuilds
     var previewHash: String {
-        "\(previewMode)\(showCrosshair)\(showMask)\(rectFOV)\(rectYaw)\(rectPitch)\(fx)\(fy)\(k1)\(k2)\(k3)\(k4)\(leftCx)\(leftCy)\(rightCx)\(rightCy)\(hfov)\(imageWidth)\(imageHeight)\(stereoRotX)\(stereoRotY)\(stereoRotZ)\(maskEdgeWidth)\(maskNumPoints)\(maskPixelRadii ?? [])\(maskAdjustMode)\(selectedMaskPoint)\(maskEdgeTreatment)"
+        "\(previewMode)\(showCrosshair)\(showMask)\(rectFOV)\(rectYaw)\(rectPitch)\(fx)\(fy)\(k1)\(k2)\(k3)\(k4)\(leftCx)\(leftCy)\(rightCx)\(rightCy)\(hfov)\(imageWidth)\(imageHeight)\(stereoRotX)\(stereoRotY)\(stereoRotZ)\(maskEdgeWidth)\(maskNumPoints)\(maskPixelRadii ?? [])\(maskAdjustMode)\(selectedMaskPoint)\(maskEdgeTreatment)\(maskMode)"
     }
 
     /// Rebuild composite — runs synchronously during alignment drag, debounced async otherwise
@@ -1349,7 +1375,7 @@ class AIMEViewModel: ObservableObject {
         ctx.draw(f, in: CGRect(x: ox, y: oy, width: CGFloat(ew), height: CGFloat(eh)))
         let imgCx = (Float(imageWidth) ?? Float(ew)) / 2
         let imgCy = (Float(imageHeight) ?? Float(eh)) / 2
-        if showMask { drawMaskAt(ctx: ctx, w: ew, h: eh, eyeCx: imgCx, eyeCy: imgCy) }
+        if showMask && maskMode == .custom { drawMaskAt(ctx: ctx, w: ew, h: eh, eyeCx: imgCx, eyeCy: imgCy) }
         if showCrosshair { drawXhairAt(ctx: ctx, w: ew, h: eh) }
         img.unlockFocus(); return img
     }
@@ -1405,7 +1431,7 @@ class AIMEViewModel: ObservableObject {
         }
         let imgCxA = (Float(imageWidth) ?? Float(ew)) / 2
         let imgCyA = (Float(imageHeight) ?? Float(eh)) / 2
-        if showMask { drawMaskAt(ctx: gctx, w: ew, h: eh, eyeCx: imgCxA, eyeCy: imgCyA) }
+        if showMask && maskMode == .custom { drawMaskAt(ctx: gctx, w: ew, h: eh, eyeCx: imgCxA, eyeCy: imgCyA) }
         if showCrosshair { drawXhairAt(ctx: gctx, w: ew, h: eh) }
         img.unlockFocus(); return img
     }
@@ -1423,7 +1449,7 @@ class AIMEViewModel: ObservableObject {
         ctx.setAlpha(1.0)
         let imgCxO = (Float(imageWidth) ?? Float(ew)) / 2
         let imgCyO = (Float(imageHeight) ?? Float(eh)) / 2
-        if showMask { drawMaskAt(ctx: ctx, w: ew, h: eh, eyeCx: imgCxO, eyeCy: imgCyO) }
+        if showMask && maskMode == .custom { drawMaskAt(ctx: ctx, w: ew, h: eh, eyeCx: imgCxO, eyeCy: imgCyO) }
         if showCrosshair { drawXhairAt(ctx: ctx, w: ew, h: eh) }
         img.unlockFocus(); return img
     }
@@ -2503,61 +2529,77 @@ struct ContentView: View {
 
                 // Mask Settings
                 GroupBox("Dynamic Mask") {
-                    Toggle("Include mask in .aime", isOn: $vm.maskEnabled).font(.caption)
-                    HStack(spacing: 4) {
-                        Text("Size").font(.caption2).frame(width: 28)
-                        Button("-") { vm.maskAdjustModeSize(delta: -1) }.font(.caption)
-                        Slider(value: Binding(
-                            get: { Double(vm.maskSizePercent) },
-                            set: { vm.setMaskSizePercent(Float($0)) }
-                        ), in: 10...150, step: 1)
-                        Button("+") { vm.maskAdjustModeSize(delta: 1) }.font(.caption)
-                        TextField("", text: Binding(
-                            get: { String(Int(vm.maskSizePercent)) },
-                            set: { if let v = Float($0) { vm.setMaskSizePercent(v) } }
-                        ))
-                        .frame(width: 36)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption.monospaced())
-                        Text("%").font(.caption2)
-                    }
-                    HStack(spacing: 8) {
-                        LabeledField("Edge Width (°)", text: $vm.maskEdgeWidth)
-                        LabeledField("Points", text: $vm.maskNumPoints)
-                        Picker("Edge", selection: $vm.maskEdgeTreatment) {
-                            Text("Linear").tag("linear")
-                            Text("Ease In/Out").tag("easeInOut")
+                    Picker("Mask Mode", selection: $vm.maskMode) {
+                        ForEach(AIMEViewModel.MaskMode.allCases, id: \.self) { mode in
+                            Text(mode.rawValue).tag(mode)
                         }
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 150)
                     }
-                    HStack {
-                        Button("Reset Mask") {
-                            vm.resetMaskRadii()
-                            vm.maskSizePercent = 95
-                        }
-                        .font(.caption)
+                    .pickerStyle(.segmented)
+
+                    if vm.maskMode == .offMaxFOV {
+                        Text("Transparent image mask — maximum FOV. Works on Vision Pro but may not preview in Immersive Utility.")
+                            .font(.caption2).foregroundColor(.secondary)
+                    } else if vm.maskMode == .offCompatible {
+                        Text("Wide dynamic mask covering ~96° from forward. Compatible with Immersive Utility.")
+                            .font(.caption2).foregroundColor(.secondary)
                     }
 
-                    // Mask Adjustment Mode
-                    Toggle(isOn: $vm.maskAdjustMode) {
-                        Text("Mask Adjustment Mode")
-                            .font(.headline)
-                    }
-                    .toggleStyle(.switch)
-                    .padding(.top, 4)
-
-                    if vm.maskAdjustMode {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Drag control points in preview to reshape the mask")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                            Toggle("Mirror Horizontally (Left ↔ Right)", isOn: $vm.maskMirrorH)
-                                .font(.caption)
-                            Toggle("Mirror Vertically (Top ↔ Bottom)", isOn: $vm.maskMirrorV)
-                                .font(.caption)
+                    if vm.maskMode == .custom {
+                        HStack(spacing: 4) {
+                            Text("Size").font(.caption2).frame(width: 28)
+                            Button("-") { vm.maskAdjustModeSize(delta: -1) }.font(.caption)
+                            Slider(value: Binding(
+                                get: { Double(vm.maskSizePercent) },
+                                set: { vm.setMaskSizePercent(Float($0)) }
+                            ), in: 10...150, step: 1)
+                            Button("+") { vm.maskAdjustModeSize(delta: 1) }.font(.caption)
+                            TextField("", text: Binding(
+                                get: { String(Int(vm.maskSizePercent)) },
+                                set: { if let v = Float($0) { vm.setMaskSizePercent(v) } }
+                            ))
+                            .frame(width: 36)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption.monospaced())
+                            Text("%").font(.caption2)
                         }
-                        .padding(.leading, 4)
+                        HStack(spacing: 8) {
+                            LabeledField("Edge Width (°)", text: $vm.maskEdgeWidth)
+                            LabeledField("Points", text: $vm.maskNumPoints)
+                            Picker("Edge", selection: $vm.maskEdgeTreatment) {
+                                Text("Linear").tag("linear")
+                                Text("Ease In/Out").tag("easeInOut")
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 150)
+                        }
+                        HStack {
+                            Button("Reset Mask") {
+                                vm.resetMaskRadii()
+                                vm.maskSizePercent = 95
+                            }
+                            .font(.caption)
+                        }
+
+                        // Mask Adjustment Mode
+                        Toggle(isOn: $vm.maskAdjustMode) {
+                            Text("Mask Adjustment Mode")
+                                .font(.headline)
+                        }
+                        .toggleStyle(.switch)
+                        .padding(.top, 4)
+
+                        if vm.maskAdjustMode {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Drag control points in preview to reshape the mask")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                Toggle("Mirror Horizontally (Left ↔ Right)", isOn: $vm.maskMirrorH)
+                                    .font(.caption)
+                                Toggle("Mirror Vertically (Top ↔ Bottom)", isOn: $vm.maskMirrorV)
+                                    .font(.caption)
+                            }
+                            .padding(.leading, 4)
+                        }
                     }
                 }
 
