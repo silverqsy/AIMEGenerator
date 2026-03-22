@@ -927,12 +927,15 @@ class AIMEViewModel: ObservableObject {
     // MARK: - Video Preview
 
     nonisolated static let ffmpegPath: String = {
-        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-            .first { FileManager.default.fileExists(atPath: $0) } ?? "ffmpeg"
+        // Prefer bundled ffmpeg, then system paths
+        let bundled = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("ffmpeg").path
+        let candidates = [bundled, "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].compactMap { $0 }
+        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? "ffmpeg"
     }()
     nonisolated static let ffprobePath: String = {
-        ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"]
-            .first { FileManager.default.fileExists(atPath: $0) } ?? "ffprobe"
+        let bundled = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("ffprobe").path
+        let candidates = [bundled, "/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"].compactMap { $0 }
+        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? "ffprobe"
     }()
 
     func loadVideo(url: URL) {
