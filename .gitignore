@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Build artifacts
+*.o
+*.d
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+build/
+DerivedData/
