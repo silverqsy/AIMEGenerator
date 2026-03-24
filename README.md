@@ -13,9 +13,10 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 - **Kannala-Brandt fisheye lens model** (OpenCV fisheye k1-k4)
 - **Per-eye principal point calibration** (cx/cy for left and right eyes)
 - **Stereo rotation offset** for rotational misalignment correction
-- **Dynamic mask** with per-point control and cubic Hermite interpolation
+- **3-mode dynamic mask**: Off (Max FOV), Off (Compatible), Custom with per-point control
 - **Live preview** with side-by-side, anaglyph, overlay, and rectilinear views
 - **Drag-to-align** for centering each eye's principal point
+- **Mask adjustment mode** with mirror H/V and size slider
 
 ## Supported Video Formats
 
@@ -29,8 +30,18 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 
 - macOS 15.0+ (Sequoia)
 - Apple Silicon Mac
-- [Homebrew ffmpeg](https://formulae.brew.sh/formula/ffmpeg) installed at `/opt/homebrew/bin/ffmpeg`
 - Xcode Command Line Tools (for `xcrun usdcat`)
+- ffmpeg/ffprobe (bundled in the release, or install via `brew install ffmpeg`)
+
+## Installation
+
+1. Download `AIMEGenerator.dmg` from the [latest release](https://github.com/silverqsy/AIMEGenerator/releases)
+2. Open the DMG and drag `AIMEGenerator.app` to your Applications folder
+3. **Important**: On first launch, if macOS says the app is "damaged" or "can't be opened", run:
+   ```bash
+   xattr -cr /Applications/AIMEGenerator.app
+   ```
+   This removes the quarantine flag added to all internet downloads. The app is ad-hoc signed.
 
 ## Quick Start
 
@@ -38,7 +49,7 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 2. Click **Import Gyroflow JSON** to load camera calibration
 3. Click **Open Video** to load your stereo footage
 4. Adjust principal points by dragging in the preview
-5. Enable **Mask Adjustment Mode** to reshape the mask boundary
+5. Toggle **Mask Adjustment Mode** to reshape the mask boundary
 6. Click **Generate .aime** to export
 
 ## Building from Source
@@ -80,6 +91,14 @@ An `.aime` file contains:
 - **Camera metadata** (baseline, frame rate, calibration name)
 
 The mesh uses the Kannala-Brandt distortion model to compute UV texture coordinates for each vertex on the sphere, allowing Apple Vision Pro to correctly undistort and display the fisheye video in immersive mode.
+
+## Mask Modes
+
+| Mode | Description |
+|------|-------------|
+| **Off (Max FOV)** | Transparent image mask — maximum field of view, works on Vision Pro but not in Immersive Utility |
+| **Off (Compatible)** | Wide dynamic mask that covers ~96° from forward — works everywhere |
+| **Custom** | Adjustable per-point mask with drag control, mirror H/V, and size slider |
 
 ## Project Files
 
