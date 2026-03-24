@@ -107,3 +107,7 @@ Save/load project settings as `.json` files to preserve your calibration between
 ## License
 
 MIT
+
+## Links
+
+[![Hypercommit](https://img.shields.io/badge/Hypercommit-DB2475)](https://hypercommit.com/aimegenerator)
