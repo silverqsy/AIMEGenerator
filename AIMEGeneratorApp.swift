@@ -3000,7 +3000,7 @@ struct ContentView: View {
 
                     Button {
                         let panel = NSSavePanel()
-                        panel.allowedContentTypes = [UTType.json]
+                        panel.allowedContentTypes = [UTType(filenameExtension: "ilpd") ?? .data]
                         panel.nameFieldStringValue = "\(vm.cameraID).ilpd"
                         panel.canCreateDirectories = true
                         if panel.runModal() == .OK, let url = panel.url {
