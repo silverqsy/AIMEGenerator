@@ -31,7 +31,11 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 - macOS 15.0+ (Sequoia)
 - Apple Silicon Mac
 - Xcode Command Line Tools (for `xcrun usdcat`)
-- ffmpeg/ffprobe (bundled in the release, or install via `brew install ffmpeg`)
+- **ffmpeg/ffprobe** — required for video preview. Install via:
+  ```bash
+  brew install ffmpeg
+  ```
+  The app will show a warning if ffmpeg is not found. Without it, video preview is unavailable but .aime generation from saved projects still works.
 
 ## Installation
 

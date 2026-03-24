@@ -2,23 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleExecutable</key>
-    <string>AIMEGenerator</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.aime.generator</string>
-    <key>CFBundleName</key>
-    <string>AIME Generator</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleVersion</key>
-    <string>1.0</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.utilities</string>
+    <key>CFBundleExecutable</key><string>AIMEGenerator</string>
+    <key>CFBundleIdentifier</key><string>com.aime.generator</string>
+    <key>CFBundleName</key><string>AIMEGenerator</string>
+    <key>CFBundleVersion</key><string>1.0</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>LSUIElement</key><false/>
 </dict>
 </plist>

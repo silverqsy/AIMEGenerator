@@ -969,19 +969,23 @@ class AIMEViewModel: ObservableObject {
 
     // MARK: - Video Preview
 
-    nonisolated static let ffmpegPath: String = {
-        // Prefer bundled ffmpeg, then system paths
+    nonisolated static let ffmpegPath: String? = {
         let bundled = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("ffmpeg").path
         let candidates = [bundled, "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].compactMap { $0 }
-        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? "ffmpeg"
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }()
-    nonisolated static let ffprobePath: String = {
+    nonisolated static let ffprobePath: String? = {
         let bundled = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("ffprobe").path
         let candidates = [bundled, "/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"].compactMap { $0 }
-        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? "ffprobe"
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }()
+    nonisolated static var hasFFmpeg: Bool { ffmpegPath != nil && ffprobePath != nil }
 
     func loadVideo(url: URL) {
+        guard AIMEViewModel.hasFFmpeg else {
+            statusMessage = "⚠️ ffmpeg/ffprobe not found. Install with: brew install ffmpeg"
+            return
+        }
         print("[loadVideo] url=\(url.path)")
         videoURL = url
         isLoadingFrame = true
@@ -1061,7 +1065,7 @@ class AIMEViewModel: ObservableObject {
     private nonisolated func probeVideo(url: URL) async throws -> VideoInfo {
         try await Task.detached {
             let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: AIMEViewModel.ffprobePath)
+            proc.executableURL = URL(fileURLWithPath: AIMEViewModel.ffprobePath!)
             proc.arguments = ["-v", "quiet", "-print_format", "json",
                               "-show_format", "-show_streams", url.path]
             let pipe = Pipe()
@@ -1173,7 +1177,7 @@ class AIMEViewModel: ObservableObject {
                 defer { try? FileManager.default.removeItem(atPath: bmpPath) }
 
                 let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: AIMEViewModel.ffmpegPath)
+                proc.executableURL = URL(fileURLWithPath: AIMEViewModel.ffmpegPath!)
                 // Split extraArgs: pre-input flags (-view_ids, -map) go before -i
                 var preInput: [String] = []
                 var postInput: [String] = []
@@ -1276,7 +1280,7 @@ class AIMEViewModel: ObservableObject {
         let exitCode: Int32 = await withCheckedContinuation { continuation in
             Thread.detachNewThread {
                 let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: AIMEViewModel.ffmpegPath)
+                proc.executableURL = URL(fileURLWithPath: AIMEViewModel.ffmpegPath!)
                 proc.arguments = args
                 // Use pipes and drain them to prevent buffer deadlock
                 let outPipe = Pipe()
