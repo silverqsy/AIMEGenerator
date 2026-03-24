@@ -714,6 +714,49 @@ class AIMEViewModel: ObservableObject {
         }
     }
 
+    func exportILPD(to url: URL) {
+        let imgW = Int(imageWidth) ?? 2048
+        let imgH = Int(imageHeight) ?? 2048
+        let fxV = Double(fx) ?? 1000, fyV = Double(fy) ?? 1000
+        let k1V = Double(k1) ?? 0, k2V = Double(k2) ?? 0, k3V = Double(k3) ?? 0, k4V = Double(k4) ?? 0
+        let lCx = Double(leftCx) ?? Double(imgW)/2, lCy = Double(leftCy) ?? Double(imgH)/2
+        let rCx = Double(rightCx) ?? Double(imgW)/2, rCy = Double(rightCy) ?? Double(imgH)/2
+        let rotX = Double(stereoRotX) ?? 0, rotY = Double(stereoRotY) ?? 0, rotZ = Double(stereoRotZ) ?? 0
+        let baselineV = Double(baseline) ?? 0.065
+        let hfovV = Double(hfov) ?? 190
+        let edgeV = Double(maskEdgeWidth) ?? 2.5
+
+        // Get mask control points from current mask state
+        var maskPts: [[Double]]? = nil
+        if maskMode == .custom {
+            let pts = maskPixelRadiiToControlPoints()
+            if !pts.isEmpty {
+                maskPts = pts.map { [Double($0.x), Double($0.y), Double($0.z)] }
+            }
+        }
+
+        statusMessage = "Fitting KB→Mei-Rives model..."
+
+        let ilpdJSON = MeiRivesFitter.generateILPD(
+            cameraID: cameraID, calibrationName: calibrationName,
+            imageWidth: imgW, imageHeight: imgH,
+            fxL: fxV, fyL: fyV, cxL: lCx, cyL: lCy,
+            fxR: fxV, fyR: fyV, cxR: rCx, cyR: rCy,
+            k1: k1V, k2: k2V, k3: k3V, k4: k4V,
+            stereoRotX: rotX, stereoRotY: rotY, stereoRotZ: rotZ,
+            baseline: baselineV, maskControlPoints: maskPts,
+            maskEdgeWidth: edgeV, hfov: hfovV, vfov: hfovV
+        )
+
+        do {
+            try ilpdJSON.write(to: url, atomically: true, encoding: .utf8)
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            statusMessage = "Exported \(url.lastPathComponent) (\(size / 1024) KB) — KB→Mei-Rives fit"
+        } catch {
+            statusMessage = "Error exporting ILPD: \(error.localizedDescription)"
+        }
+    }
+
     func generateAIME(to url: URL) async {
         isGenerating = true
         statusMessage = "Generating projection mesh..."
@@ -2102,6 +2145,319 @@ class GPURenderer {
 
 // MARK: - Mesh Generation
 
+// MARK: - KB to Mei-Rives Fitting & ILPD Export
+
+enum MeiRivesFitter {
+    struct MeiRivesParams {
+        var fx: Double, fy: Double, cx: Double, cy: Double
+        var xi: Double  // mirror/projection offset
+        var k1: Double, k2: Double  // radial distortion
+        var p1: Double, p2: Double  // tangential distortion
+    }
+
+    /// Project 3D direction through Mei-Rives model to pixel coordinates
+    static func meiProject(x: Double, y: Double, z: Double, p: MeiRivesParams) -> (Double, Double) {
+        let norm = sqrt(x*x + y*y + z*z)
+        let xs = x/norm, ys = y/norm, zs = z/norm
+        let denom = zs + p.xi
+        guard abs(denom) > 1e-10 else { return (p.cx, p.cy) }
+        let uProj = xs / denom, vProj = ys / denom
+        let r2 = uProj*uProj + vProj*vProj
+        let radial = 1.0 + p.k1 * r2 + p.k2 * r2 * r2
+        let uDist = uProj * radial + 2*p.p1*uProj*vProj + p.p2*(r2 + 2*uProj*uProj)
+        let vDist = vProj * radial + p.p1*(r2 + 2*vProj*vProj) + 2*p.p2*uProj*vProj
+        return (p.fx * uDist + p.cx, p.fy * vDist + p.cy)
+    }
+
+    /// Project incidence angle through Kannala-Brandt to pixel coordinates
+    static func kbProject(theta: Double, phi: Double,
+                          fx: Double, fy: Double, cx: Double, cy: Double,
+                          k1: Double, k2: Double, k3: Double, k4: Double) -> (Double, Double) {
+        let t2 = theta * theta
+        let thetaD = theta * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+        return (fx * thetaD * cos(phi) + cx, fy * thetaD * sin(phi) + cy)
+    }
+
+    /// Fit Mei-Rives parameters to match a given KB model
+    /// Uses Gauss-Newton optimization on a grid of ray directions
+    static func fitKBtoMeiRives(
+        fx: Double, fy: Double, cx: Double, cy: Double,
+        k1: Double, k2: Double, k3: Double, k4: Double,
+        imageWidth: Double, imageHeight: Double
+    ) -> MeiRivesParams {
+        let fAvg = 0.5 * (fx + fy)
+
+        // Find theta_max (where projected radius hits image boundary)
+        let maxRadius = min(cx, cy, imageWidth - cx, imageHeight - cy)
+        var lo = 0.0, hi = Double.pi
+        for _ in 0..<100 {
+            let mid = 0.5 * (lo + hi)
+            let t2 = mid * mid
+            let thetaD = mid * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+            if fAvg * thetaD < maxRadius { lo = mid } else { hi = mid }
+        }
+        let thetaMax = lo * 0.95  // use 95% to avoid extreme edge
+
+        // Generate grid of sample points
+        let nTheta = 40, nPhi = 36
+        var sampleThetas: [Double] = []
+        var samplePhis: [Double] = []
+        var targetU: [Double] = []
+        var targetV: [Double] = []
+
+        for it in 0..<nTheta {
+            let theta = 0.01 + (thetaMax - 0.01) * Double(it) / Double(nTheta - 1)
+            for ip in 0..<nPhi {
+                let phi = 2.0 * .pi * Double(ip) / Double(nPhi)
+                sampleThetas.append(theta)
+                samplePhis.append(phi)
+                let (u, v) = kbProject(theta: theta, phi: phi, fx: fx, fy: fy, cx: cx, cy: cy,
+                                       k1: k1, k2: k2, k3: k3, k4: k4)
+                targetU.append(u)
+                targetV.append(v)
+            }
+        }
+
+        let n = sampleThetas.count
+        // 3D ray directions
+        var X = [Double](repeating: 0, count: n)
+        var Y = [Double](repeating: 0, count: n)
+        var Z = [Double](repeating: 0, count: n)
+        for i in 0..<n {
+            X[i] = sin(sampleThetas[i]) * cos(samplePhis[i])
+            Y[i] = sin(sampleThetas[i]) * sin(samplePhis[i])
+            Z[i] = cos(sampleThetas[i])
+        }
+
+        // Initial guess: xi=1.5, fx_mr = fx_kb * (1+xi)
+        let xiInit = 1.5
+        var params = MeiRivesParams(
+            fx: fx * (1 + xiInit), fy: fy * (1 + xiInit),
+            cx: cx, cy: cy, xi: xiInit,
+            k1: 0, k2: 0, p1: 0, p2: 0
+        )
+
+        // Gauss-Newton iterations (optimize fx, fy, xi, k1, k2 — keep cx/cy/p1/p2 fixed initially)
+        // Parameterize as array: [fx, fy, xi, k1, k2]
+        var p = [params.fx, params.fy, params.xi, params.k1, params.k2]
+
+        func computeResiduals(_ p: [Double]) -> [Double] {
+            let pr = MeiRivesParams(fx: p[0], fy: p[1], cx: cx, cy: cy, xi: p[2], k1: p[3], k2: p[4], p1: 0, p2: 0)
+            var res = [Double](repeating: 0, count: 2 * n)
+            for i in 0..<n {
+                let (u, v) = meiProject(x: X[i], y: Y[i], z: Z[i], p: pr)
+                res[i] = u - targetU[i]
+                res[n + i] = v - targetV[i]
+            }
+            return res
+        }
+
+        func computeJacobian(_ p: [Double]) -> [[Double]] {
+            let delta = 1e-7
+            let r0 = computeResiduals(p)
+            var J = [[Double]](repeating: [Double](repeating: 0, count: 5), count: 2 * n)
+            for j in 0..<5 {
+                var pj = p; pj[j] += delta
+                let rj = computeResiduals(pj)
+                for i in 0..<(2 * n) {
+                    J[i][j] = (rj[i] - r0[i]) / delta
+                }
+            }
+            return J
+        }
+
+        // Levenberg-Marquardt
+        var lambda = 1e-3
+        for _ in 0..<200 {
+            let res = computeResiduals(p)
+            let J = computeJacobian(p)
+
+            // JᵀJ and Jᵀr
+            var JtJ = [[Double]](repeating: [Double](repeating: 0, count: 5), count: 5)
+            var Jtr = [Double](repeating: 0, count: 5)
+            for i in 0..<(2 * n) {
+                for a in 0..<5 {
+                    Jtr[a] += J[i][a] * res[i]
+                    for b in 0..<5 {
+                        JtJ[a][b] += J[i][a] * J[i][b]
+                    }
+                }
+            }
+
+            // Damping
+            for a in 0..<5 { JtJ[a][a] *= (1 + lambda) }
+
+            // Solve 5x5 system (Gaussian elimination)
+            var A = JtJ; var b = Jtr.map { -$0 }
+            for col in 0..<5 {
+                var maxRow = col; var maxVal = abs(A[col][col])
+                for row in (col+1)..<5 { if abs(A[row][col]) > maxVal { maxVal = abs(A[row][col]); maxRow = row } }
+                if maxRow != col { A.swapAt(col, maxRow); b.swapAt(col, maxRow) }
+                guard abs(A[col][col]) > 1e-20 else { continue }
+                for row in (col+1)..<5 {
+                    let f = A[row][col] / A[col][col]
+                    for c in col..<5 { A[row][c] -= f * A[col][c] }
+                    b[row] -= f * b[col]
+                }
+            }
+            var dp = [Double](repeating: 0, count: 5)
+            for i in stride(from: 4, through: 0, by: -1) {
+                dp[i] = b[i]
+                for j in (i+1)..<5 { dp[i] -= A[i][j] * dp[j] }
+                dp[i] /= A[i][i]
+            }
+
+            // Try update
+            var pNew = p; for i in 0..<5 { pNew[i] += dp[i] }
+            if pNew[2] < 0.01 { pNew[2] = 0.01 }  // xi > 0
+
+            let resNew = computeResiduals(pNew)
+            let costOld = res.reduce(0) { $0 + $1*$1 }
+            let costNew = resNew.reduce(0) { $0 + $1*$1 }
+
+            if costNew < costOld {
+                p = pNew; lambda *= 0.5
+                if costOld - costNew < 1e-14 { break }
+            } else {
+                lambda *= 10
+            }
+        }
+
+        return MeiRivesParams(fx: p[0], fy: p[1], cx: cx, cy: cy, xi: p[2], k1: p[3], k2: p[4], p1: 0, p2: 0)
+    }
+
+    /// Generate ILPD JSON string from app parameters
+    static func generateILPD(
+        cameraID: String, calibrationName: String,
+        imageWidth: Int, imageHeight: Int,
+        fxL: Double, fyL: Double, cxL: Double, cyL: Double,
+        fxR: Double, fyR: Double, cxR: Double, cyR: Double,
+        k1: Double, k2: Double, k3: Double, k4: Double,
+        stereoRotX: Double, stereoRotY: Double, stereoRotZ: Double,
+        baseline: Double,
+        maskControlPoints: [[Double]]?,
+        maskEdgeWidth: Double,
+        hfov: Double, vfov: Double
+    ) -> String {
+        // Fit Mei-Rives for left eye
+        let mrL = fitKBtoMeiRives(fx: fxL, fy: fyL, cx: cxL, cy: cyL,
+                                   k1: k1, k2: k2, k3: k3, k4: k4,
+                                   imageWidth: Double(imageWidth), imageHeight: Double(imageHeight))
+        // Fit Mei-Rives for right eye
+        let mrR = fitKBtoMeiRives(fx: fxR, fy: fyR, cx: cxR, cy: cyR,
+                                   k1: k1, k2: k2, k3: k3, k4: k4,
+                                   imageWidth: Double(imageWidth), imageHeight: Double(imageHeight))
+
+        // Build quaternion from stereo rotation (half applied to each eye, opposite signs)
+        let halfX = stereoRotX * .pi / 360.0  // half angle in radians
+        let halfY = stereoRotY * .pi / 360.0
+        let halfZ = stereoRotZ * .pi / 360.0
+        func eulerToQuat(rx: Double, ry: Double, rz: Double) -> [Double] {
+            let cx = cos(rx), sx = sin(rx), cy = cos(ry), sy = sin(ry), cz = cos(rz), sz = sin(rz)
+            return [
+                sx*cy*cz - cx*sy*sz,  // x
+                cx*sy*cz + sx*cy*sz,  // y
+                cx*cy*sz - sx*sy*cz,  // z
+                cx*cy*cz + sx*sy*sz   // w
+            ]
+        }
+        let quatL = eulerToQuat(rx: -halfX, ry: -halfY, rz: -halfZ)
+        let quatR = eulerToQuat(rx: halfX, ry: halfY, rz: halfZ)
+
+        // Default mask points if none provided
+        let maskPts: [[Double]]
+        if let pts = maskControlPoints, !pts.isEmpty {
+            maskPts = pts
+        } else {
+            // Generate default circular mask (64 points, r=0.985, z=-0.17364822)
+            let count = 64
+            let r = 0.9848077
+            let z = -0.17364822
+            maskPts = (0..<count).map { i in
+                let angle = Double.pi - Double(i) / Double(count) * 2.0 * .pi
+                return [r * cos(angle), r * sin(angle), z]
+            }
+        }
+
+        func formatPts(_ pts: [[Double]]) -> String {
+            pts.map { "[\($0.map { String(format: "%.8g", $0) }.joined(separator: ", "))]" }.joined(separator: ",\n                            ")
+        }
+
+        func viewJSON(desc: String, mr: MeiRivesParams, quat: [Double], translation: [Double]) -> String {
+            """
+                    {
+                        "extrinsics": [{
+                            "model": "dualRectification",
+                            "quat": [\(quat.map { String(format: "%.16g", $0) }.joined(separator: ", "))],
+                            "translation": [\(translation.map { String(format: "%.1f", $0) }.joined(separator: ", "))]
+                        }],
+                        "imageSize": [\(imageWidth), \(imageHeight)],
+                        "intrinsics": {
+                            "calibrationLimitRadialAngle": -1.0,
+                            "centerX": \(String(format: "%.6f", mr.cx)),
+                            "centerY": \(String(format: "%.6f", mr.cy)),
+                            "distortions": [\(String(format: "%.16g", mr.k1)), \(String(format: "%.16g", mr.k2)), \(String(format: "%.16g", mr.xi)), \(String(format: "%.16g", mr.p1)), \(String(format: "%.16g", mr.p2))],
+                            "fx": \(String(format: "%.6f", mr.fx)),
+                            "fy": \(String(format: "%.6f", mr.fy)),
+                            "imageLimitRadialAngle": -1.0,
+                            "model": "radial2ProjectionOffsetTangential2",
+                            "skew": 0.0
+                        },
+                        "lensOcclusionData": {},
+                        "maskData": {
+                            "FOVHeight": 90,
+                            "FOVWidth": 60,
+                            "controlPointInterpolation": "cubicHermite",
+                            "defaultCalibration": "default",
+                            "edgeTreatment": "linear",
+                            "edgeWidth": \(String(format: "%.1f", maskEdgeWidth)),
+                            "isForVisionOS": true,
+                            "leftMapToRight": "standAlone",
+                            "maskColor": [1, 1, 1],
+                            "maskViewParameters": {
+                                "controlPoints": [
+                                \(formatPts(maskPts))
+                                ],
+                                "controlPointsOffsets": {},
+                                "viewDescription": "\(desc)"
+                            },
+                            "name": "custom_mask"
+                        },
+                        "opticalData": {
+                            "Fov": {
+                                "horizontal": \(String(format: "%.4f", hfov)),
+                                "vertical": \(String(format: "%.4f", vfov))
+                            },
+                            "aperture": 4.0
+                        },
+                        "processingParameters": {},
+                        "viewDescription": "\(desc)"
+                    }
+            """
+        }
+
+        let leftView = viewJSON(desc: "left", mr: mrL, quat: quatL, translation: [0, 0, 0])
+        let rightView = viewJSON(desc: "right", mr: mrR, quat: quatR, translation: [-baseline * 1000, 0, 0])  // baseline in mm
+
+        return """
+        {
+            "cameraID": "\(cameraID)",
+            "captureDevice": {
+                "calStationName": "AIMEGenerator",
+                "views": [
+        \(leftView),
+        \(rightView)
+                ]
+            },
+            "formatVersion": [0, 1, 0],
+            "generator": "AIMEGenerator",
+            "generatorVersion": [1, 0, 0],
+            "uuid": "\(UUID().uuidString.lowercased())"
+        }
+        """
+    }
+}
+
 enum MeshGen {
     // Kannala-Brandt fisheye model: theta_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
     static func generateHemisphereMesh(
@@ -2640,6 +2996,23 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.blue)
                     .disabled(vm.isGenerating)
+                    .controlSize(.large)
+
+                    Button {
+                        let panel = NSSavePanel()
+                        panel.allowedContentTypes = [UTType.json]
+                        panel.nameFieldStringValue = "\(vm.cameraID).ilpd"
+                        panel.canCreateDirectories = true
+                        if panel.runModal() == .OK, let url = panel.url {
+                            vm.exportILPD(to: url)
+                        }
+                    } label: {
+                        Label("Export .ilpd", systemImage: "doc.text")
+                            .font(.headline)
+                            .padding(.horizontal, 8)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
                     .controlSize(.large)
                 }
             }
