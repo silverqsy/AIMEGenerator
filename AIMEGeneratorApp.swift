@@ -2998,22 +2998,23 @@ struct ContentView: View {
                     .disabled(vm.isGenerating)
                     .controlSize(.large)
 
-                    Button {
-                        let panel = NSSavePanel()
-                        panel.allowedContentTypes = [UTType(filenameExtension: "ilpd") ?? .data]
-                        panel.nameFieldStringValue = "\(vm.cameraID).ilpd"
-                        panel.canCreateDirectories = true
-                        if panel.runModal() == .OK, let url = panel.url {
-                            vm.exportILPD(to: url)
-                        }
-                    } label: {
-                        Label("Export .ilpd", systemImage: "doc.text")
-                            .font(.headline)
-                            .padding(.horizontal, 8)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .controlSize(.large)
+                    // ILPD export hidden for now
+                    // Button {
+                    //     let panel = NSSavePanel()
+                    //     panel.allowedContentTypes = [UTType(filenameExtension: "ilpd") ?? .data]
+                    //     panel.nameFieldStringValue = "\(vm.cameraID).ilpd"
+                    //     panel.canCreateDirectories = true
+                    //     if panel.runModal() == .OK, let url = panel.url {
+                    //         vm.exportILPD(to: url)
+                    //     }
+                    // } label: {
+                    //     Label("Export .ilpd", systemImage: "doc.text")
+                    //         .font(.headline)
+                    //         .padding(.horizontal, 8)
+                    // }
+                    // .buttonStyle(.borderedProminent)
+                    // .tint(.green)
+                    // .controlSize(.large)
                 }
             }
             .padding(20)
