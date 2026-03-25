@@ -1410,9 +1410,12 @@ class AIMEViewModel: ObservableObject {
         let origW = Float(imageWidth) ?? Float(ew)
         let origH = Float(imageHeight) ?? Float(eh)
         let sx = Float(ew) / origW, sy = Float(eh) / origH
-        // Shift so that (cx,cy) in image coords ends up at (ew/2, eh/2) in frame coords
+        // cx/cy are in image coords (cx from left, cy from top)
+        // CGContext has Y=0 at bottom
+        // Must match shader behavior: increasing cy moves content UP in headset
+        // In CG: increasing cy → image shifts down → offY decreases
         let offX = CGFloat(Float(ew) / 2.0 - cx * sx)
-        let offY = CGFloat(Float(eh) / 2.0 - (Float(eh) - cy * sy))  // flip Y for CG coords
+        let offY = CGFloat((Float(eh) - cy * sy) - Float(eh) / 2.0)
         return (offX, offY)
     }
 
@@ -1967,7 +1970,7 @@ class GPURenderer {
         stereoPitch: Float = 0, stereoYaw: Float = 0, stereoRoll: Float = 0,
         showMask: Bool, maskEdge: Float = 2.5, maskAngleDeg: Float = 85.0
     ) -> NSImage? {
-        let outW = 800, outH = 800
+        let outW = min(Int(frame.width), 2048), outH = min(Int(frame.height), 2048)
         guard let srcTex = makeTexture(from: frame) else { return nil }
 
         let dstDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: outW, height: outH, mipmapped: false)
@@ -2025,7 +2028,7 @@ class GPURenderer {
         stereoPitch: Float = 0, stereoYaw: Float = 0, stereoRoll: Float = 0,
         showMask: Bool, maskEdge: Float = 2.5, maskAngleDeg: Float = 85.0
     ) -> NSImage? {
-        let outW = 800, outH = 800
+        let outW = min(Int(left.width), 2048), outH = min(Int(left.height), 2048)
         guard let lSrc = makeTexture(from: left), let rSrc = makeTexture(from: right) else { return nil }
 
         let mkDst = { () -> MTLTexture? in
@@ -2837,14 +2840,14 @@ struct ContentView: View {
                     HStack(spacing: 24) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Left Eye (reference)").font(.caption.bold())
-                            LabeledField("cx", text: $vm.leftCx)
-                            LabeledField("cy", text: $vm.leftCy)
+                            StepperField("cx", text: $vm.leftCx, step: 0.1)
+                            StepperField("cy", text: $vm.leftCy, step: 0.1)
                         }
                         Divider().frame(height: 80)
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Right Eye").font(.caption.bold())
-                            LabeledField("cx", text: $vm.rightCx)
-                            LabeledField("cy", text: $vm.rightCy)
+                            StepperField("cx", text: $vm.rightCx, step: 0.1)
+                            StepperField("cy", text: $vm.rightCy, step: 0.1)
                         }
                     }
                     if let lCx = Float(vm.leftCx), let rCx = Float(vm.rightCx),
@@ -3336,7 +3339,7 @@ struct PreviewInteractionOverlay: NSViewRepresentable {
                 let pixelScale = Float(origW) / Float(imgW) / Float(fitScale)
 
                 let imgDx = Float(dx) * pixelScale
-                let imgDy = Float(-dy) * pixelScale  // flip Y
+                let imgDy = Float(dy) * pixelScale  // match shader Y convention
 
                 // Check if shift was pressed/released during drag
                 let currentMode: DragMode
