@@ -19,7 +19,6 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 - **Mask adjustment mode** with mirror H/V and size slider
 - **ILPD export** with KB→Mei-Rives model conversion
 - **ILPD video injection** — embed ILPD metadata directly into MOV files for DaVinci Resolve
-- **Top/Bottom stereo** layout support
 
 ## Supported Video Formats
 
