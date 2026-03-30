@@ -4,11 +4,11 @@
 
 By Siyang Qi
 
-A macOS tool for creating `.aime` lens profile files used by Apple Vision Pro to play back third-party immersive (VR180 stereo) video content.
+A macOS tool for creating `.aime` lens profile files and `.ilpd` (Immersive Lens Profile Data) for third-party immersive (VR180 stereo) video on Apple Vision Pro. Also supports injecting ILPD metadata directly into video files for DaVinci Resolve's immersive workflow.
 
 ## What it does
 
-AIME Generator takes camera calibration data (from Gyroflow or manual input) and generates `.aime` files that tell Apple Vision Pro how to correctly project fisheye video onto the immersive display. It supports:
+AIME Generator takes camera calibration data (from Gyroflow or manual input) and generates `.aime` and `.ilpd` files that tell Apple Vision Pro / DaVinci Resolve how to correctly project fisheye video onto the immersive display. It supports:
 
 - **Kannala-Brandt fisheye lens model** (OpenCV fisheye k1-k4)
 - **Per-eye principal point calibration** (cx/cy for left and right eyes)
@@ -17,6 +17,9 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 - **Live preview** with side-by-side, anaglyph, overlay, and rectilinear views
 - **Drag-to-align** for centering each eye's principal point
 - **Mask adjustment mode** with mirror H/V and size slider
+- **ILPD export** with KB→Mei-Rives model conversion
+- **ILPD video injection** — embed ILPD metadata directly into MOV files for DaVinci Resolve
+- **Top/Bottom stereo** layout support
 
 ## Supported Video Formats
 
@@ -24,13 +27,29 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 |--------|-------------|
 | **MV-HEVC** | Apple's multiview HEVC (stereo in one track) |
 | **SBS** | Side-by-side (left+right in one frame) |
+| **Top/Bottom** | Top/bottom (left on top, right on bottom) |
 | **OSV** | Dual-stream (two video tracks in one container) |
+
+## ILPD Injection (DaVinci Resolve)
+
+The app can inject ILPD calibration metadata directly into MOV video files. This makes DaVinci Resolve recognize the footage as Apple Immersive content with lens calibration data.
+
+**Supported containers for injection:** MOV files with standard codecs (ProRes, HEVC, MV-HEVC, H.264). Proprietary raw formats (BRAW, CRM, R3D) are not supported — transcode to ProRes/MOV first.
+
+### How it works
+1. Load your video and calibration
+2. Click **Inject ILPD to Video** — saves a new MOV with metadata next to the original
+3. Import the injected MOV into DaVinci Resolve
+4. Resolve will recognize it as immersive content (Immersive ID, Projection, Calibration Type columns populate)
+
+The `inject_ilpd_v2.py` script and `ilpd_template.json` must be in the same directory as the app.
 
 ## Requirements
 
 - macOS 15.0+ (Sequoia)
 - Apple Silicon Mac
 - Xcode Command Line Tools (for `xcrun usdcat`)
+- Python 3 (for ILPD video injection)
 - **ffmpeg/ffprobe** — required for video preview. Install via:
   ```bash
   brew install ffmpeg
@@ -41,11 +60,11 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 
 1. Download `AIMEGenerator.dmg` from the [latest release](https://github.com/silverqsy/AIMEGenerator/releases)
 2. Open the DMG and drag `AIMEGenerator.app` to your Applications folder
-3. **Important**: On first launch, if macOS says the app is "damaged" or "can't be opened", run:
+3. Place `inject_ilpd_v2.py` and `ilpd_template.json` next to the app (same directory)
+4. **Important**: On first launch, if macOS says the app is "damaged" or "can't be opened", run:
    ```bash
    xattr -cr /Applications/AIMEGenerator.app
    ```
-   This removes the quarantine flag added to all internet downloads. The app is ad-hoc signed.
 
 ## Quick Start
 
@@ -54,36 +73,22 @@ AIME Generator takes camera calibration data (from Gyroflow or manual input) and
 3. Click **Open Video** to load your stereo footage
 4. Adjust principal points by dragging in the preview
 5. Toggle **Mask Adjustment Mode** to reshape the mask boundary
-6. Click **Generate .aime** to export
+6. Click **Generate .aime** to export for Apple Vision Pro
+7. Click **Export .ilpd** to export for DaVinci Resolve
+8. Click **Inject ILPD to Video** to embed calibration into the video file
 
 ## Building from Source
 
 ```bash
 swiftc -parse-as-library -O \
   -o AIMEGenerator \
-  -framework SwiftUI -framework UniformTypeIdentifiers -framework Metal \
-  -framework AVFoundation -framework CoreImage -framework AppKit \
-  -framework ImmersiveMediaSupport \
+  -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers \
+  -framework AVFoundation -framework VideoToolbox -framework CoreMedia \
   AIMEGeneratorApp.swift
 
 # Create .app bundle
 mkdir -p AIMEGenerator.app/Contents/MacOS
 cp AIMEGenerator AIMEGenerator.app/Contents/MacOS/
-cat > AIMEGenerator.app/Contents/Info.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key><string>AIMEGenerator</string>
-    <key>CFBundleIdentifier</key><string>com.aime.generator</string>
-    <key>CFBundleName</key><string>AIMEGenerator</string>
-    <key>CFBundleVersion</key><string>1.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>NSPrincipalClass</key><string>NSApplication</string>
-    <key>LSUIElement</key><false/>
-</dict>
-</plist>
-EOF
 codesign --force --sign - AIMEGenerator.app
 ```
 
@@ -95,6 +100,15 @@ An `.aime` file contains:
 - **Camera metadata** (baseline, frame rate, calibration name)
 
 The mesh uses the Kannala-Brandt distortion model to compute UV texture coordinates for each vertex on the sphere, allowing Apple Vision Pro to correctly undistort and display the fisheye video in immersive mode.
+
+## How ILPD Works
+
+An `.ilpd` file is a JSON file containing the **Mei-Rives (Unified Camera Model)** lens parameters. The app converts from the Kannala-Brandt model to Mei-Rives using Levenberg-Marquardt optimization with:
+- Analytical xi estimation from projection curve shape
+- Xi lower-bound constraint for physically meaningful parameters
+- Dense sampling at high angles where models diverge
+
+DaVinci Resolve uses ILPD data for its Apple Immersive Video workflow, enabling lens correction and stereo alignment during editing and export.
 
 ## Mask Modes
 

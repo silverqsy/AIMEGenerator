@@ -314,6 +314,9 @@ class AIMEViewModel: ObservableObject {
     @Published var previewMode: PreviewMode = .anaglyph
     @Published var isLoadingFrame = false
     @Published var swapEyes: Bool = true
+    @Published var flipILPDCalibration: Bool = false
+    @Published var showInjectAlert: Bool = false
+    @Published var injectAlertMessage: String = ""
     @Published var showCrosshair: Bool = true
     @Published var showMask: Bool = true
     // maskAdjustMode is declared in the mask section above
@@ -333,7 +336,7 @@ class AIMEViewModel: ObservableObject {
     var eyeHeight: Int = 0
     var videoFormat: VideoFormat = .sbs
 
-    enum VideoFormat: String { case sbs = "SBS", dualStream = "Dual Stream (OSV)", mvhevc = "MV-HEVC" }
+    enum VideoFormat: String { case sbs = "SBS", tab = "Top/Bottom", dualStream = "Dual Stream (OSV)", mvhevc = "MV-HEVC" }
 
     let gpuRenderer = GPURenderer()
     @Published var cachedComposite: NSImage?
@@ -737,24 +740,137 @@ class AIMEViewModel: ObservableObject {
 
         statusMessage = "Fitting KB→Mei-Rives model..."
 
+        // Generate deterministic camera UUID from cameraID string, and a fresh calibration UUID
+        let cameraUUID = UUID(uuidFromName: cameraID).uuidString.lowercased()
+        let calibrationUUID = UUID().uuidString.lowercased()
+
         let ilpdJSON = MeiRivesFitter.generateILPD(
-            cameraID: cameraID, calibrationName: calibrationName,
+            cameraID: cameraUUID, calibrationName: calibrationName,
+            calibrationUUID: calibrationUUID,
             imageWidth: imgW, imageHeight: imgH,
             fxL: fxV, fyL: fyV, cxL: lCx, cyL: lCy,
             fxR: fxV, fyR: fyV, cxR: rCx, cyR: rCy,
             k1: k1V, k2: k2V, k3: k3V, k4: k4V,
             stereoRotX: rotX, stereoRotY: rotY, stereoRotZ: rotZ,
             baseline: baselineV, maskControlPoints: maskPts,
-            maskEdgeWidth: edgeV, hfov: hfovV, vfov: hfovV
+            maskEdgeWidth: edgeV, hfov: hfovV, vfov: hfovV,
+            flipLR: flipILPDCalibration
         )
 
+        // Use {cameraUUID}.{calibrationUUID}.ilpd naming convention
+        let ilpdFilename = "\(cameraUUID).\(calibrationUUID).ilpd"
+        let ilpdURL = url.deletingLastPathComponent().appendingPathComponent(ilpdFilename)
+
         do {
-            try ilpdJSON.write(to: url, atomically: true, encoding: .utf8)
-            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-            statusMessage = "Exported \(url.lastPathComponent) (\(size / 1024) KB) — KB→Mei-Rives fit"
+            try ilpdJSON.write(to: ilpdURL, atomically: true, encoding: .utf8)
+            let size = (try? FileManager.default.attributesOfItem(atPath: ilpdURL.path)[.size] as? Int) ?? 0
+            statusMessage = "Exported \(ilpdFilename) (\(size / 1024) KB) — KB→Mei-Rives fit"
         } catch {
             statusMessage = "Error exporting ILPD: \(error.localizedDescription)"
         }
+    }
+
+    /// Generate ILPD JSON string using current parameters (shared by exportILPD and injectILPD)
+    private func generateILPDJSON() -> String? {
+        let imgW = Int(imageWidth) ?? 2048
+        let imgH = Int(imageHeight) ?? 2048
+        let fxV = Double(fx) ?? 1000, fyV = Double(fy) ?? 1000
+        let k1V = Double(k1) ?? 0, k2V = Double(k2) ?? 0, k3V = Double(k3) ?? 0, k4V = Double(k4) ?? 0
+        let lCx = Double(leftCx) ?? Double(imgW)/2, lCy = Double(leftCy) ?? Double(imgH)/2
+        let rCx = Double(rightCx) ?? Double(imgW)/2, rCy = Double(rightCy) ?? Double(imgH)/2
+        let rotX = Double(stereoRotX) ?? 0, rotY = Double(stereoRotY) ?? 0, rotZ = Double(stereoRotZ) ?? 0
+        let baselineV = Double(baseline) ?? 0.065
+        let hfovV = Double(hfov) ?? 190
+        let edgeV = Double(maskEdgeWidth) ?? 2.5
+
+        var maskPts: [[Double]]? = nil
+        if maskMode == .custom {
+            let pts = maskPixelRadiiToControlPoints()
+            if !pts.isEmpty {
+                maskPts = pts.map { [Double($0.x), Double($0.y), Double($0.z)] }
+            }
+        }
+
+        let cameraUUID = UUID(uuidFromName: cameraID).uuidString.lowercased()
+        let calibrationUUID = UUID().uuidString.lowercased()
+
+        return MeiRivesFitter.generateILPD(
+            cameraID: cameraUUID, calibrationName: calibrationName,
+            calibrationUUID: calibrationUUID,
+            imageWidth: imgW, imageHeight: imgH,
+            fxL: fxV, fyL: fyV, cxL: lCx, cyL: lCy,
+            fxR: fxV, fyR: fyV, cxR: rCx, cyR: rCy,
+            k1: k1V, k2: k2V, k3: k3V, k4: k4V,
+            stereoRotX: rotX, stereoRotY: rotY, stereoRotZ: rotZ,
+            baseline: baselineV, maskControlPoints: maskPts,
+            maskEdgeWidth: edgeV, hfov: hfovV, vfov: hfovV,
+            flipLR: flipILPDCalibration
+        )
+    }
+
+    func injectILPDToVideo(outputURL: URL) {
+        guard let videoURL = videoURL else {
+            statusMessage = "No video loaded"
+            return
+        }
+        guard let ilpdJSON = generateILPDJSON() else {
+            statusMessage = "Error generating ILPD"
+            return
+        }
+
+        statusMessage = "Injecting ILPD metadata into video..."
+
+        // Write ILPD to temp file
+        let tmpDir = FileManager.default.temporaryDirectory
+        let tmpILPD = tmpDir.appendingPathComponent("inject_temp.ilpd")
+        do {
+            try ilpdJSON.write(to: tmpILPD, atomically: true, encoding: .utf8)
+        } catch {
+            statusMessage = "Error writing temp ILPD: \(error.localizedDescription)"
+            return
+        }
+
+        // Find inject_ilpd_v2.py next to the app bundle or in the project dir
+        let appDir = Bundle.main.bundleURL.deletingLastPathComponent()
+        let scriptCandidates = [
+            appDir.appendingPathComponent("inject_ilpd_v2.py"),
+            appDir.appendingPathComponent("Aime investigate").appendingPathComponent("inject_ilpd_v2.py"),
+            URL(fileURLWithPath: "/Users/siyangqi/Downloads/Aime investigate/inject_ilpd_v2.py")
+        ]
+        guard let scriptURL = scriptCandidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            statusMessage = "Error: inject_ilpd_v2.py not found"
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = [scriptURL.path, videoURL.path, tmpILPD.path, outputURL.path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+            if proc.terminationStatus == 0 {
+                let size = (try? FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? Int) ?? 0
+                injectAlertMessage = "Saved to \(outputURL.lastPathComponent) (\(size / 1024 / 1024) MB)"
+                showInjectAlert = true
+                statusMessage = "Injected ILPD → \(outputURL.lastPathComponent)"
+            } else {
+                injectAlertMessage = "Injection failed: \(output.suffix(200))"
+                showInjectAlert = true
+                statusMessage = "Injection failed"
+            }
+        } catch {
+            injectAlertMessage = "Error: \(error.localizedDescription)"
+            showInjectAlert = true
+            statusMessage = "Error running injector"
+        }
+
+        try? FileManager.default.removeItem(at: tmpILPD)
     }
 
     func generateAIME(to url: URL) async {
@@ -786,10 +902,11 @@ class AIMEViewModel: ObservableObject {
 
             // Build stereo rotation quaternion (half-angle applied opposite to each eye)
             func makeRotQuat(_ x: Float, _ y: Float, _ z: Float) -> simd_quatf {
+                // Reverse order (Rx * Ry * Rz) to match preview's inverse-rotation convention
                 let qx = simd_quatf(angle: x * .pi / 180.0, axis: SIMD3<Float>(1, 0, 0))
                 let qy = simd_quatf(angle: y * .pi / 180.0, axis: SIMD3<Float>(0, 1, 0))
                 let qz = simd_quatf(angle: z * .pi / 180.0, axis: SIMD3<Float>(0, 0, 1))
-                return qz * qy * qx
+                return qx * qy * qz
             }
 
             // Left eye: rotate by -half the stereo offset
@@ -800,7 +917,7 @@ class AIMEViewModel: ObservableObject {
                 hfov: hfovV, thetaSteps: thetaV, phiSteps: phiV
             )
             if hasRotation {
-                let qLeft = makeRotQuat(-sRotX / 2, -sRotY / 2, -sRotZ / 2)
+                let qLeft = makeRotQuat(sRotX / 2, sRotY / 2, sRotZ / 2)
                 leftVerts = leftVerts.map { qLeft.act($0) }
             }
 
@@ -821,7 +938,7 @@ class AIMEViewModel: ObservableObject {
                     hfov: hfovV, thetaSteps: thetaV, phiSteps: phiV
                 )
                 if hasRotation {
-                    let qRight = makeRotQuat(sRotX / 2, sRotY / 2, sRotZ / 2)
+                    let qRight = makeRotQuat(-sRotX / 2, -sRotY / 2, -sRotZ / 2)
                     rightVerts = rightVerts.map { qRight.act($0) }
                 }
             }
@@ -1013,6 +1130,12 @@ class AIMEViewModel: ObservableObject {
                     self.eyeHeight = info.height
                     self.videoInfo = "SBS | \(info.width)x\(info.height) → \(eyeWidth)x\(eyeHeight) per eye | \(String(format: "%.1fs", duration))"
 
+                case .tab:
+                    self.videoFormat = .tab
+                    self.eyeWidth = info.width
+                    self.eyeHeight = info.height / 2
+                    self.videoInfo = "Top/Bottom | \(info.width)x\(info.height) → \(eyeWidth)x\(eyeHeight) per eye | \(String(format: "%.1fs", duration))"
+
                 case .mvhevc:
                     self.videoFormat = .mvhevc
                     self.eyeWidth = info.width
@@ -1038,8 +1161,8 @@ class AIMEViewModel: ObservableObject {
                 if self.rightCx == "1024.0" { self.rightCx = cx }
                 if self.rightCy == "1024.0" { self.rightCy = cy }
 
-                // Also try AVFoundation for SBS (faster scrubbing)
-                if info.format == .sbs {
+                // Also try AVFoundation for SBS/TAB (faster scrubbing)
+                if info.format == .sbs || info.format == .tab {
                     let a = AVURLAsset(url: url)
                     self.asset = a
                     let gen = AVAssetImageGenerator(asset: a)
@@ -1058,7 +1181,7 @@ class AIMEViewModel: ObservableObject {
         }
     }
 
-    enum DetectedFormat { case sbs, dualStream, mvhevc, mono }
+    enum DetectedFormat { case sbs, tab, dualStream, mvhevc, mono }
     struct VideoInfo { var width: Int; var height: Int; var duration: Double; var format: DetectedFormat; var videoStreamCount: Int }
 
     /// Use ffprobe to detect video format — runs off main thread
@@ -1100,6 +1223,8 @@ class AIMEViewModel: ObservableObject {
                 detected = .dualStream
             } else if w > 0 && h > 0 && abs(Double(w) / Double(h) - 2.0) < 0.1 {
                 detected = .sbs
+            } else if w > 0 && h > 0 && abs(Double(h) / Double(w) - 2.0) < 0.1 {
+                detected = .tab
             } else {
                 let sideDataList = first["side_data_list"] as? [[String: Any]] ?? []
                 let hasStereo = sideDataList.contains { ($0["side_data_type"] as? String)?.contains("Stereo") == true }
@@ -1133,11 +1258,12 @@ class AIMEViewModel: ObservableObject {
                     let leftRect = CGRect(x: 0, y: 0, width: halfW, height: h)
                     let rightRect = CGRect(x: halfW, y: 0, width: halfW, height: h)
                     if swapEyes {
-                        self.leftFrame = cgImage.cropping(to: rightRect)
-                        self.rightFrame = cgImage.cropping(to: leftRect)
-                    } else {
                         self.leftFrame = cgImage.cropping(to: leftRect)
                         self.rightFrame = cgImage.cropping(to: rightRect)
+                    } else {
+                        // Default SBS: left half = right eye, right half = left eye
+                        self.leftFrame = cgImage.cropping(to: rightRect)
+                        self.rightFrame = cgImage.cropping(to: leftRect)
                     }
                 } else {
                     // Fallback: ffmpeg for SBS
@@ -1146,8 +1272,35 @@ class AIMEViewModel: ObservableObject {
                         let w = cg.width; let halfW = w / 2; let h = cg.height
                         let l = cg.cropping(to: CGRect(x: 0, y: 0, width: halfW, height: h))
                         let r = cg.cropping(to: CGRect(x: halfW, y: 0, width: halfW, height: h))
-                        if swapEyes { self.leftFrame = r; self.rightFrame = l }
-                        else { self.leftFrame = l; self.rightFrame = r }
+                        if swapEyes { self.leftFrame = l; self.rightFrame = r }
+                        else { self.leftFrame = r; self.rightFrame = l }
+                    }
+                }
+
+            case .tab:
+                // Top/Bottom: single frame, split top/bottom
+                if let gen = imgGenerator {
+                    let cmTime = CMTime(seconds: time, preferredTimescale: 600)
+                    let (cgImage, _) = try await gen.image(at: cmTime)
+                    let w = cgImage.width; let h = cgImage.height; let halfH = h / 2
+                    let topRect = CGRect(x: 0, y: 0, width: w, height: halfH)
+                    let bottomRect = CGRect(x: 0, y: halfH, width: w, height: halfH)
+                    if swapEyes {
+                        self.leftFrame = cgImage.cropping(to: bottomRect)
+                        self.rightFrame = cgImage.cropping(to: topRect)
+                    } else {
+                        // Default TAB: top = left eye, bottom = right eye
+                        self.leftFrame = cgImage.cropping(to: topRect)
+                        self.rightFrame = cgImage.cropping(to: bottomRect)
+                    }
+                } else {
+                    let cg = try await ffmpegExtractFrame(url: videoURL, time: time, extraArgs: [])
+                    if let cg = cg {
+                        let w = cg.width; let h = cg.height; let halfH = h / 2
+                        let top = cg.cropping(to: CGRect(x: 0, y: 0, width: w, height: halfH))
+                        let bot = cg.cropping(to: CGRect(x: 0, y: halfH, width: w, height: halfH))
+                        if swapEyes { self.leftFrame = bot; self.rightFrame = top }
+                        else { self.leftFrame = top; self.rightFrame = bot }
                     }
                 }
 
@@ -1366,21 +1519,16 @@ class AIMEViewModel: ObservableObject {
             self.cachedComposite = nil; return
         }
 
-        // Skip expensive stereo rotation during alignment drag
         let left: CGImage
         let right: CGImage
-        if !isDraggingAlignment {
-            let halfSX = self.pStereoX / 2, halfSY = self.pStereoY / 2, halfSZ = self.pStereoZ / 2
-            let hasStereoRot = abs(halfSX) > 0.0001 || abs(halfSY) > 0.0001 || abs(halfSZ) > 0.0001
-            let isFisheye = [PreviewMode.sideBySide, .anaglyph, .overlay, .leftOnly, .rightOnly].contains(self.previewMode)
-            if hasStereoRot && isFisheye {
-                left = self.applyFisheyeRotation(frame: rawLeft, cx: self.pLCx, cy: self.pLCy,
-                    pitch: -halfSX, yaw: -halfSY, roll: -halfSZ) ?? rawLeft
-                right = self.applyFisheyeRotation(frame: rawRight, cx: self.pRCx, cy: self.pRCy,
-                    pitch: halfSX, yaw: halfSY, roll: halfSZ) ?? rawRight
-            } else {
-                left = rawLeft; right = rawRight
-            }
+        let sRX = self.pStereoX / 2, sRY = self.pStereoY / 2, sRZ = self.pStereoZ / 2
+        let hasStereoRot = abs(sRX) > 0.0001 || abs(sRY) > 0.0001 || abs(sRZ) > 0.0001
+        let isFisheye = [PreviewMode.sideBySide, .anaglyph, .overlay, .leftOnly, .rightOnly].contains(self.previewMode)
+        if hasStereoRot && isFisheye {
+            left = self.applyFisheyeRotation(frame: rawLeft, cx: self.pLCx, cy: self.pLCy,
+                pitch: -sRX, yaw: -sRY, roll: -sRZ) ?? rawLeft
+            right = self.applyFisheyeRotation(frame: rawRight, cx: self.pRCx, cy: self.pRCy,
+                pitch: sRX, yaw: sRY, roll: sRZ) ?? rawRight
         } else {
             left = rawLeft; right = rawRight
         }
@@ -1397,8 +1545,8 @@ class AIMEViewModel: ObservableObject {
         case .overlay:    img = self.compositeOverlay(left: left, right: right, ew: ew, eh: eh)
         case .leftOnly:   img = self.singleEye(left, cx: self.pLCx, cy: self.pLCy, ew: ew, eh: eh)
         case .rightOnly:  img = self.singleEye(right, cx: self.pRCx, cy: self.pRCy, ew: ew, eh: eh)
-        case .rectLeft:   img = self.rectReproject(frame: rawLeft, cx: self.pLCx, cy: self.pLCy, ew: ew, eh: eh, stereoSign: -1)
-        case .rectRight:  img = self.rectReproject(frame: rawRight, cx: self.pRCx, cy: self.pRCy, ew: ew, eh: eh, stereoSign: 1)
+        case .rectLeft:   img = self.rectReproject(frame: rawLeft, cx: self.pLCx, cy: self.pLCy, ew: ew, eh: eh, stereoSign: -0.5)
+        case .rectRight:  img = self.rectReproject(frame: rawRight, cx: self.pRCx, cy: self.pRCy, ew: ew, eh: eh, stereoSign: 0.5)
         case .rectAnaglyph: img = self.rectAnaglyphComposite(left: rawLeft, right: rawRight, ew: ew, eh: eh)
         }
 
@@ -1981,17 +2129,18 @@ class GPURenderer {
         let scaleY = Float(frame.height) / imageHeight
         let fovRad = rectFOV * .pi / 180
 
-        // Combined rotation: stereo offset then view rotation
+        // Combined rotation: view rotation then stereo offset
+        // Stereo applied after view so alignment stays consistent when panning
         let (s0, s1, s2) = GPURenderer.rotationMatrix(pitch: stereoPitch, yaw: stereoYaw, roll: stereoRoll)
         let (v0, v1, v2) = GPURenderer.rotationMatrix(pitch: rectPitch * .pi / 180, yaw: rectYaw * .pi / 180, roll: 0)
-        // Multiply: view * stereo (stereo applied first)
+        // Multiply: stereo * view (view applied first, then stereo)
         func dot3(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Float { a.x*b.x + a.y*b.y + a.z*b.z }
-        let sc0 = SIMD3<Float>(s0.x, s1.x, s2.x) // columns of stereo matrix
-        let sc1 = SIMD3<Float>(s0.y, s1.y, s2.y)
-        let sc2 = SIMD3<Float>(s0.z, s1.z, s2.z)
-        let r0 = SIMD3<Float>(dot3(v0, sc0), dot3(v0, sc1), dot3(v0, sc2))
-        let r1 = SIMD3<Float>(dot3(v1, sc0), dot3(v1, sc1), dot3(v1, sc2))
-        let r2 = SIMD3<Float>(dot3(v2, sc0), dot3(v2, sc1), dot3(v2, sc2))
+        let vc0 = SIMD3<Float>(v0.x, v1.x, v2.x) // columns of view matrix
+        let vc1 = SIMD3<Float>(v0.y, v1.y, v2.y)
+        let vc2 = SIMD3<Float>(v0.z, v1.z, v2.z)
+        let r0 = SIMD3<Float>(dot3(s0, vc0), dot3(s0, vc1), dot3(s0, vc2))
+        let r1 = SIMD3<Float>(dot3(s1, vc0), dot3(s1, vc1), dot3(s1, vc2))
+        let r2 = SIMD3<Float>(dot3(s2, vc0), dot3(s2, vc1), dot3(s2, vc2))
 
         var params = RectParams(
             outW: UInt32(outW), outH: UInt32(outH),
@@ -2045,17 +2194,18 @@ class GPURenderer {
         func makeParams(cx: Float, cy: Float, stereoSign: Float) -> RectParams {
             let (s0, s1, s2) = GPURenderer.rotationMatrix(pitch: stereoPitch * stereoSign, yaw: stereoYaw * stereoSign, roll: stereoRoll * stereoSign)
             let (v0, v1, v2) = GPURenderer.rotationMatrix(pitch: rectPitch * .pi / 180, yaw: rectYaw * .pi / 180, roll: 0)
+            // Multiply: stereo * view (view applied first, then stereo)
             func dot3(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Float { a.x*b.x + a.y*b.y + a.z*b.z }
-            let sc0 = SIMD3<Float>(s0.x, s1.x, s2.x)
-            let sc1 = SIMD3<Float>(s0.y, s1.y, s2.y)
-            let sc2 = SIMD3<Float>(s0.z, s1.z, s2.z)
+            let vc0 = SIMD3<Float>(v0.x, v1.x, v2.x)
+            let vc1 = SIMD3<Float>(v0.y, v1.y, v2.y)
+            let vc2 = SIMD3<Float>(v0.z, v1.z, v2.z)
             return RectParams(
                 outW: UInt32(outW), outH: UInt32(outH),
                 srcW: UInt32(left.width), srcH: UInt32(left.height),
                 focalOut: Float(outW / 2) / tan(fovRad / 2),
-                rot0: SIMD3<Float>(dot3(v0, sc0), dot3(v0, sc1), dot3(v0, sc2)),
-                rot1: SIMD3<Float>(dot3(v1, sc0), dot3(v1, sc1), dot3(v1, sc2)),
-                rot2: SIMD3<Float>(dot3(v2, sc0), dot3(v2, sc1), dot3(v2, sc2)),
+                rot0: SIMD3<Float>(dot3(s0, vc0), dot3(s0, vc1), dot3(s0, vc2)),
+                rot1: SIMD3<Float>(dot3(s1, vc0), dot3(s1, vc1), dot3(s1, vc2)),
+                rot2: SIMD3<Float>(dot3(s2, vc0), dot3(s2, vc1), dot3(s2, vc2)),
                 cx: cx * scaleX, cy: cy * scaleY, fx: fx * scaleX, fy: fy * scaleY,
                 k1: k1, k2: k2, k3: k3, k4: k4,
                 maskHalf: maskAngleDeg * .pi / 180, maskEdge: maskEdge * .pi / 180, showMask: showMask ? 1 : 0
@@ -2185,35 +2335,72 @@ enum MeiRivesFitter {
         return (fx * thetaD * cos(phi) + cx, fy * thetaD * sin(phi) + cy)
     }
 
+    /// Result of KB→Mei-Rives fitting, including the calibration limit angle
+    struct FitResult {
+        var params: MeiRivesParams
+        var calibrationLimitRadialAngle: Double  // degrees
+        var hfov: Double  // full horizontal FOV in degrees
+        var vfov: Double  // full vertical FOV in degrees
+    }
+
     /// Fit Mei-Rives parameters to match a given KB model
-    /// Uses Gauss-Newton optimization on a grid of ray directions
+    /// Uses Levenberg-Marquardt optimization on a grid of ray directions
     static func fitKBtoMeiRives(
         fx: Double, fy: Double, cx: Double, cy: Double,
         k1: Double, k2: Double, k3: Double, k4: Double,
         imageWidth: Double, imageHeight: Double
-    ) -> MeiRivesParams {
-        let fAvg = 0.5 * (fx + fy)
-
-        // Find theta_max (where projected radius hits image boundary)
-        let maxRadius = min(cx, cy, imageWidth - cx, imageHeight - cy)
-        var lo = 0.0, hi = Double.pi
-        for _ in 0..<100 {
-            let mid = 0.5 * (lo + hi)
-            let t2 = mid * mid
-            let thetaD = mid * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
-            if fAvg * thetaD < maxRadius { lo = mid } else { hi = mid }
+    ) -> FitResult {
+        // Find theta_max per axis (where projected radius hits image boundary and KB is monotonic)
+        func findThetaMax(f: Double, maxR: Double) -> Double {
+            var lo = 0.0, hi = Double.pi
+            for _ in 0..<100 {
+                let mid = 0.5 * (lo + hi)
+                let t2 = mid * mid
+                let thetaD = mid * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+                let deriv = 1.0 + t2 * (3*k1 + t2 * (5*k2 + t2 * (7*k3 + t2 * 9*k4)))
+                if f * thetaD < maxR && deriv > 0.05 { lo = mid } else { hi = mid }
+            }
+            return lo
         }
-        let thetaMax = lo * 0.95  // use 95% to avoid extreme edge
 
-        // Generate grid of sample points
-        let nTheta = 40, nPhi = 36
+        // Compute max angles for each direction
+        let thetaMaxH = findThetaMax(f: fx, maxR: min(cx, imageWidth - cx))
+        let thetaMaxV = findThetaMax(f: fy, maxR: min(cy, imageHeight - cy))
+        let thetaMax = min(thetaMaxH, thetaMaxV)
+        let thetaFit = thetaMax * 0.98
+
+        // Compute actual FOV from KB model
+        let fullHFOV = (thetaMaxH * 2.0) * 180.0 / .pi
+        let fullVFOV = (thetaMaxV * 2.0) * 180.0 / .pi
+
+        // Estimate xi analytically from projection shape.
+        // Pure MR (no distortion): r = f_mr * sin(theta) / (cos(theta) + xi)
+        // Ratio at two angles depends only on xi, not f_mr.
+        // From KB: ratio = theta_d(a) / theta_d(b)
+        // From MR: ratio = [sin(a)*(cos(b)+xi)] / [sin(b)*(cos(a)+xi)]
+        // Solve: xi = [sin(a)*cos(b) - R*sin(b)*cos(a)] / [R*sin(b) - sin(a)]
+        let thetaA = 0.5236  // ~30 deg
+        let thetaB = 1.2217  // ~70 deg
+        let t2A = thetaA * thetaA, t2B = thetaB * thetaB
+        let tdA = thetaA * (1.0 + t2A * (k1 + t2A * (k2 + t2A * (k3 + t2A * k4))))
+        let tdB = thetaB * (1.0 + t2B * (k1 + t2B * (k2 + t2B * (k3 + t2B * k4))))
+        let projRatio = tdA / tdB
+        let xiNumer = sin(thetaA)*cos(thetaB) - projRatio*sin(thetaB)*cos(thetaA)
+        let xiDenom = projRatio*sin(thetaB) - sin(thetaA)
+        let xiAnalytical = abs(xiDenom) > 1e-10 ? xiNumer / xiDenom : 2.0
+        let xiInit = max(1.0, min(xiAnalytical, 5.0))  // clamp to reasonable range
+        let xiMin = xiInit * 0.8  // lower bound during optimization
+
+        // Generate grid of sample points — denser near the edges
+        let nTheta = 60, nPhi = 48
         var sampleThetas: [Double] = []
         var samplePhis: [Double] = []
         var targetU: [Double] = []
         var targetV: [Double] = []
 
         for it in 0..<nTheta {
-            let theta = 0.01 + (thetaMax - 0.01) * Double(it) / Double(nTheta - 1)
+            let t = Double(it) / Double(nTheta - 1)
+            let theta = 0.01 + (thetaFit - 0.01) * (0.3 * t + 0.7 * t * t)
             for ip in 0..<nPhi {
                 let phi = 2.0 * .pi * Double(ip) / Double(nPhi)
                 sampleThetas.append(theta)
@@ -2226,27 +2413,19 @@ enum MeiRivesFitter {
         }
 
         let n = sampleThetas.count
-        // 3D ray directions
+        // 3D ray directions — camera looks along +Z (standard UCM / ILPD convention)
         var X = [Double](repeating: 0, count: n)
         var Y = [Double](repeating: 0, count: n)
         var Z = [Double](repeating: 0, count: n)
         for i in 0..<n {
             X[i] = sin(sampleThetas[i]) * cos(samplePhis[i])
             Y[i] = sin(sampleThetas[i]) * sin(samplePhis[i])
-            Z[i] = cos(sampleThetas[i])
+            Z[i] = cos(sampleThetas[i])  // +Z = optical axis (ILPD convention)
         }
 
-        // Initial guess: xi=1.5, fx_mr = fx_kb * (1+xi)
-        let xiInit = 1.5
-        var params = MeiRivesParams(
-            fx: fx * (1 + xiInit), fy: fy * (1 + xiInit),
-            cx: cx, cy: cy, xi: xiInit,
-            k1: 0, k2: 0, p1: 0, p2: 0
-        )
-
-        // Gauss-Newton iterations (optimize fx, fy, xi, k1, k2 — keep cx/cy/p1/p2 fixed initially)
-        // Parameterize as array: [fx, fy, xi, k1, k2]
-        var p = [params.fx, params.fy, params.xi, params.k1, params.k2]
+        // Initial: fx_mr = fx_kb * (1 + xi)
+        let nParams = 5
+        var p = [fx * (1 + xiInit), fy * (1 + xiInit), xiInit, 0.0, 0.0]
 
         func computeResiduals(_ p: [Double]) -> [Double] {
             let pr = MeiRivesParams(fx: p[0], fy: p[1], cx: cx, cy: cy, xi: p[2], k1: p[3], k2: p[4], p1: 0, p2: 0)
@@ -2262,8 +2441,8 @@ enum MeiRivesFitter {
         func computeJacobian(_ p: [Double]) -> [[Double]] {
             let delta = 1e-7
             let r0 = computeResiduals(p)
-            var J = [[Double]](repeating: [Double](repeating: 0, count: 5), count: 2 * n)
-            for j in 0..<5 {
+            var J = [[Double]](repeating: [Double](repeating: 0, count: nParams), count: 2 * n)
+            for j in 0..<nParams {
                 var pj = p; pj[j] += delta
                 let rj = computeResiduals(pj)
                 for i in 0..<(2 * n) {
@@ -2273,50 +2452,47 @@ enum MeiRivesFitter {
             return J
         }
 
-        // Levenberg-Marquardt
+        // Levenberg-Marquardt with xi lower-bound constraint
         var lambda = 1e-3
-        for _ in 0..<200 {
+        for _ in 0..<500 {
             let res = computeResiduals(p)
             let J = computeJacobian(p)
 
-            // JᵀJ and Jᵀr
-            var JtJ = [[Double]](repeating: [Double](repeating: 0, count: 5), count: 5)
-            var Jtr = [Double](repeating: 0, count: 5)
+            var JtJ = [[Double]](repeating: [Double](repeating: 0, count: nParams), count: nParams)
+            var Jtr = [Double](repeating: 0, count: nParams)
             for i in 0..<(2 * n) {
-                for a in 0..<5 {
+                for a in 0..<nParams {
                     Jtr[a] += J[i][a] * res[i]
-                    for b in 0..<5 {
+                    for b in 0..<nParams {
                         JtJ[a][b] += J[i][a] * J[i][b]
                     }
                 }
             }
 
-            // Damping
-            for a in 0..<5 { JtJ[a][a] *= (1 + lambda) }
+            for a in 0..<nParams { JtJ[a][a] *= (1 + lambda) }
 
-            // Solve 5x5 system (Gaussian elimination)
             var A = JtJ; var b = Jtr.map { -$0 }
-            for col in 0..<5 {
+            for col in 0..<nParams {
                 var maxRow = col; var maxVal = abs(A[col][col])
-                for row in (col+1)..<5 { if abs(A[row][col]) > maxVal { maxVal = abs(A[row][col]); maxRow = row } }
+                for row in (col+1)..<nParams { if abs(A[row][col]) > maxVal { maxVal = abs(A[row][col]); maxRow = row } }
                 if maxRow != col { A.swapAt(col, maxRow); b.swapAt(col, maxRow) }
                 guard abs(A[col][col]) > 1e-20 else { continue }
-                for row in (col+1)..<5 {
+                for row in (col+1)..<nParams {
                     let f = A[row][col] / A[col][col]
-                    for c in col..<5 { A[row][c] -= f * A[col][c] }
+                    for c in col..<nParams { A[row][c] -= f * A[col][c] }
                     b[row] -= f * b[col]
                 }
             }
-            var dp = [Double](repeating: 0, count: 5)
-            for i in stride(from: 4, through: 0, by: -1) {
+            var dp = [Double](repeating: 0, count: nParams)
+            for i in stride(from: nParams - 1, through: 0, by: -1) {
                 dp[i] = b[i]
-                for j in (i+1)..<5 { dp[i] -= A[i][j] * dp[j] }
+                for j in (i+1)..<nParams { dp[i] -= A[i][j] * dp[j] }
                 dp[i] /= A[i][i]
             }
 
-            // Try update
-            var pNew = p; for i in 0..<5 { pNew[i] += dp[i] }
-            if pNew[2] < 0.01 { pNew[2] = 0.01 }  // xi > 0
+            var pNew = p; for i in 0..<nParams { pNew[i] += dp[i] }
+            // Clamp xi to physically meaningful range (prevents degenerate xi≈1 solutions)
+            if pNew[2] < xiMin { pNew[2] = xiMin }
 
             let resNew = computeResiduals(pNew)
             let costOld = res.reduce(0) { $0 + $1*$1 }
@@ -2330,12 +2506,19 @@ enum MeiRivesFitter {
             }
         }
 
-        return MeiRivesParams(fx: p[0], fy: p[1], cx: cx, cy: cy, xi: p[2], k1: p[3], k2: p[4], p1: 0, p2: 0)
+        let finalParams = MeiRivesParams(fx: p[0], fy: p[1], cx: cx, cy: cy, xi: p[2], k1: p[3], k2: p[4], p1: 0, p2: 0)
+        return FitResult(
+            params: finalParams,
+            calibrationLimitRadialAngle: thetaMax * 180.0 / .pi,
+            hfov: fullHFOV,
+            vfov: fullVFOV
+        )
     }
 
     /// Generate ILPD JSON string from app parameters
     static func generateILPD(
         cameraID: String, calibrationName: String,
+        calibrationUUID: String,
         imageWidth: Int, imageHeight: Int,
         fxL: Double, fyL: Double, cxL: Double, cyL: Double,
         fxR: Double, fyR: Double, cxR: Double, cyR: Double,
@@ -2344,124 +2527,189 @@ enum MeiRivesFitter {
         baseline: Double,
         maskControlPoints: [[Double]]?,
         maskEdgeWidth: Double,
-        hfov: Double, vfov: Double
+        hfov: Double, vfov: Double,
+        flipLR: Bool = false
     ) -> String {
         // Fit Mei-Rives for left eye
-        let mrL = fitKBtoMeiRives(fx: fxL, fy: fyL, cx: cxL, cy: cyL,
-                                   k1: k1, k2: k2, k3: k3, k4: k4,
-                                   imageWidth: Double(imageWidth), imageHeight: Double(imageHeight))
+        let fitL = fitKBtoMeiRives(fx: fxL, fy: fyL, cx: cxL, cy: cyL,
+                                    k1: k1, k2: k2, k3: k3, k4: k4,
+                                    imageWidth: Double(imageWidth), imageHeight: Double(imageHeight))
+        let mrL = fitL.params
         // Fit Mei-Rives for right eye
-        let mrR = fitKBtoMeiRives(fx: fxR, fy: fyR, cx: cxR, cy: cyR,
-                                   k1: k1, k2: k2, k3: k3, k4: k4,
-                                   imageWidth: Double(imageWidth), imageHeight: Double(imageHeight))
+        let fitR = fitKBtoMeiRives(fx: fxR, fy: fyR, cx: cxR, cy: cyR,
+                                    k1: k1, k2: k2, k3: k3, k4: k4,
+                                    imageWidth: Double(imageWidth), imageHeight: Double(imageHeight))
+        let mrR = fitR.params
 
         // Build quaternion from stereo rotation (half applied to each eye, opposite signs)
-        let halfX = stereoRotX * .pi / 360.0  // half angle in radians
-        let halfY = stereoRotY * .pi / 360.0
-        let halfZ = stereoRotZ * .pi / 360.0
+        let halfX = stereoRotX * .pi / 720.0
+        let halfY = stereoRotY * .pi / 720.0
+        let halfZ = stereoRotZ * .pi / 720.0
         func eulerToQuat(rx: Double, ry: Double, rz: Double) -> [Double] {
             let cx = cos(rx), sx = sin(rx), cy = cos(ry), sy = sin(ry), cz = cos(rz), sz = sin(rz)
             return [
-                sx*cy*cz - cx*sy*sz,  // x
-                cx*sy*cz + sx*cy*sz,  // y
-                cx*cy*sz - sx*sy*cz,  // z
-                cx*cy*cz + sx*sy*sz   // w
+                sx*cy*cz + cx*sy*sz,
+                cx*sy*cz - sx*cy*sz,
+                cx*cy*sz + sx*sy*cz,
+                cx*cy*cz - sx*sy*sz
             ]
         }
-        let quatL = eulerToQuat(rx: -halfX, ry: -halfY, rz: -halfZ)
-        let quatR = eulerToQuat(rx: halfX, ry: halfY, rz: halfZ)
+        let quatL = eulerToQuat(rx: halfX, ry: -halfY, rz: -halfZ)
+        let quatR = eulerToQuat(rx: -halfX, ry: halfY, rz: halfZ)
 
-        // Default mask points if none provided
-        let maskPts: [[Double]]
-        if let pts = maskControlPoints, !pts.isEmpty {
-            maskPts = pts
-        } else {
-            // Generate default circular mask (64 points, r=0.985, z=-0.17364822)
-            let count = 64
-            let r = 0.9848077
-            let z = -0.17364822
-            maskPts = (0..<count).map { i in
-                let angle = Double.pi - Double(i) / Double(count) * 2.0 * .pi
-                return [r * cos(angle), r * sin(angle), z]
+        // Select L/R assignment (flip if needed)
+        let leftMR = flipLR ? mrR : mrL
+        let rightMR = flipLR ? mrL : mrR
+        let leftQuat = flipLR ? quatR : quatL
+        let rightQuat = flipLR ? quatL : quatR
+        let leftFit = flipLR ? fitR : fitL
+        let rightFit = flipLR ? fitL : fitR
+
+        // Load the known working ILPD template
+        let appParent = Bundle.main.bundleURL.deletingLastPathComponent().path
+        let templatePaths = [
+            Bundle.main.path(forResource: "ilpd_template", ofType: "json"),
+            "\(appParent)/ilpd_template.json",
+            "\(appParent)/Aime investigate/ilpd_template.json",
+            "/Users/siyangqi/Downloads/Aime investigate/ilpd_template.json"
+        ].compactMap { $0 }
+
+        // Use template-based approach: start from known working ILPD, replace only essential values
+        // If template not found, build from scratch using the reference structure
+        func buildFromTemplate() -> String? {
+            for path in templatePaths {
+                guard let data = FileManager.default.contents(atPath: path),
+                      var tmpl = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      var device = tmpl["captureDevice"] as? [String: Any],
+                      var views = device["views"] as? [[String: Any]],
+                      views.count >= 2 else { continue }
+
+                // Update top-level fields
+                tmpl["cameraID"] = cameraID
+                tmpl["uuid"] = calibrationUUID
+
+                // Update each view
+                for idx in 0..<2 {
+                    let mr = idx == 0 ? leftMR : rightMR
+                    let quat = idx == 0 ? leftQuat : rightQuat
+                    let fit = idx == 0 ? leftFit : rightFit
+                    let trans: [Double] = idx == 0 ? [0, 0, 0] : [-baseline * 1000, 0, 0]
+
+                    // Extrinsics
+                    if var exts = views[idx]["extrinsics"] as? [[String: Any]] {
+                        exts[0]["quat"] = quat
+                        exts[0]["translation"] = trans
+                        views[idx]["extrinsics"] = exts
+                    }
+
+                    // Image size
+                    views[idx]["imageSize"] = [imageWidth, imageHeight]
+
+                    // Intrinsics — only replace essential values
+                    if var intr = views[idx]["intrinsics"] as? [String: Any] {
+                        intr["centerX"] = mr.cx
+                        intr["centerY"] = Double(imageHeight) - mr.cy
+                        intr["fx"] = mr.fx
+                        intr["fy"] = mr.fy
+                        intr["distortions"] = [mr.k1, mr.k2, mr.xi, mr.p1, mr.p2]
+                        intr["calibrationLimitRadialAngle"] = fit.calibrationLimitRadialAngle
+                        views[idx]["intrinsics"] = intr
+                    }
+
+                    // Optical data FOV
+                    if var opt = views[idx]["opticalData"] as? [String: Any] {
+                        opt["Fov"] = ["horizontal": fit.hfov, "vertical": fit.vfov]
+                        views[idx]["opticalData"] = opt
+                    }
+                }
+
+                device["views"] = views
+                tmpl["captureDevice"] = device
+
+                if let jsonData = try? JSONSerialization.data(withJSONObject: tmpl, options: [.prettyPrinted, .sortedKeys]),
+                   let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    return jsonStr
+                }
+                return nil
             }
+            return nil
         }
 
-        func formatPts(_ pts: [[Double]]) -> String {
-            pts.map { "[\($0.map { String(format: "%.8g", $0) }.joined(separator: ", "))]" }.joined(separator: ",\n                            ")
+        if let result = buildFromTemplate() {
+            return result
         }
 
-        func viewJSON(desc: String, mr: MeiRivesParams, quat: [Double], translation: [Double]) -> String {
+        // Fallback: build JSON from scratch (original approach)
+        func formatArr(_ a: [Double], _ fmt: String) -> String {
+            a.map { String(format: fmt, $0) }.joined(separator: ", ")
+        }
+
+        func viewJSON(desc: String, mr: MeiRivesParams, quat: [Double], translation: [Double],
+                      calLimitAngle: Double, viewHFOV: Double, viewVFOV: Double) -> String {
             """
                     {
-                        "extrinsics": [{
-                            "model": "dualRectification",
-                            "quat": [\(quat.map { String(format: "%.16g", $0) }.joined(separator: ", "))],
-                            "translation": [\(translation.map { String(format: "%.1f", $0) }.joined(separator: ", "))]
-                        }],
+                        "extrinsics": [{"model": "dualRectification", "quat": [\(formatArr(quat, "%.16g"))], "translation": [\(formatArr(translation, "%.1f"))]}],
                         "imageSize": [\(imageWidth), \(imageHeight)],
                         "intrinsics": {
-                            "calibrationLimitRadialAngle": -1.0,
+                            "calibrationLimitRadialAngle": \(String(format: "%.6f", calLimitAngle)),
                             "centerX": \(String(format: "%.6f", mr.cx)),
-                            "centerY": \(String(format: "%.6f", mr.cy)),
+                            "centerY": \(String(format: "%.6f", Double(imageHeight) - mr.cy)),
                             "distortions": [\(String(format: "%.16g", mr.k1)), \(String(format: "%.16g", mr.k2)), \(String(format: "%.16g", mr.xi)), \(String(format: "%.16g", mr.p1)), \(String(format: "%.16g", mr.p2))],
-                            "fx": \(String(format: "%.6f", mr.fx)),
-                            "fy": \(String(format: "%.6f", mr.fy)),
-                            "imageLimitRadialAngle": -1.0,
-                            "model": "radial2ProjectionOffsetTangential2",
-                            "skew": 0.0
+                            "fx": \(String(format: "%.6f", mr.fx)), "fy": \(String(format: "%.6f", mr.fy)),
+                            "imageLimitRadialAngle": -1.0, "model": "radial2ProjectionOffsetTangential2", "skew": 0.0
                         },
                         "lensOcclusionData": {},
-                        "maskData": {
-                            "FOVHeight": 90,
-                            "FOVWidth": 60,
-                            "controlPointInterpolation": "cubicHermite",
-                            "defaultCalibration": "default",
-                            "edgeTreatment": "linear",
-                            "edgeWidth": \(String(format: "%.1f", maskEdgeWidth)),
-                            "isForVisionOS": true,
-                            "leftMapToRight": "standAlone",
-                            "maskColor": [1, 1, 1],
-                            "maskViewParameters": {
-                                "controlPoints": [
-                                \(formatPts(maskPts))
-                                ],
-                                "controlPointsOffsets": {},
-                                "viewDescription": "\(desc)"
-                            },
-                            "name": "custom_mask"
-                        },
-                        "opticalData": {
-                            "Fov": {
-                                "horizontal": \(String(format: "%.4f", hfov)),
-                                "vertical": \(String(format: "%.4f", vfov))
-                            },
-                            "aperture": 4.0
-                        },
+                        "maskData": {"FOVHeight": 90, "FOVWidth": 60, "controlPointInterpolation": "cubicHermite", "defaultCalibration": "default", "edgeTreatment": "linear", "edgeWidth": 2.5, "isForVisionOS": true, "leftMapToRight": "standAlone", "maskColor": [1, 1, 1], "maskViewParameters": {"controlPoints": [[-0.9848077, 0, -0.17364822], [0, -0.9848077, -0.17364822], [0.9848077, 0, -0.17364822], [0, 0.9848077, -0.17364822]], "controlPointsOffsets": {}, "viewDescription": "\(desc)"}, "name": "174_fov_circular_32_points"},
+                        "opticalData": {"Fov": {"horizontal": \(String(format: "%.4f", viewHFOV)), "vertical": \(String(format: "%.4f", viewVFOV))}, "aperture": 4.0},
                         "processingParameters": {},
                         "viewDescription": "\(desc)"
                     }
             """
         }
 
-        let leftView = viewJSON(desc: "left", mr: mrL, quat: quatL, translation: [0, 0, 0])
-        let rightView = viewJSON(desc: "right", mr: mrR, quat: quatR, translation: [-baseline * 1000, 0, 0])  // baseline in mm
-
         return """
         {
+            "ambientCalTemp": 20.0,
             "cameraID": "\(cameraID)",
             "captureDevice": {
                 "calStationName": "AIMEGenerator",
                 "views": [
-        \(leftView),
-        \(rightView)
+        \(viewJSON(desc: "left", mr: leftMR, quat: leftQuat, translation: [0,0,0], calLimitAngle: leftFit.calibrationLimitRadialAngle, viewHFOV: leftFit.hfov, viewVFOV: leftFit.vfov)),
+        \(viewJSON(desc: "right", mr: rightMR, quat: rightQuat, translation: [-baseline*1000,0,0], calLimitAngle: rightFit.calibrationLimitRadialAngle, viewHFOV: rightFit.hfov, viewVFOV: rightFit.vfov))
                 ]
             },
             "formatVersion": [0, 1, 0],
-            "generator": "AIMEGenerator",
-            "generatorVersion": [1, 0, 0],
-            "uuid": "\(UUID().uuidString.lowercased())"
+            "generator": "Apple Immersive Camera Calibration Service",
+            "generatorVersion": [1, 18, 0],
+            "uuid": "\(calibrationUUID)"
         }
         """
+    }
+}
+
+// MARK: - Deterministic UUID v5 from name
+extension UUID {
+    /// Generate a deterministic UUID v5 from a name string using a fixed namespace
+    init(uuidFromName name: String) {
+        // Use a fixed namespace UUID (DNS namespace from RFC 4122)
+        let namespace: [UInt8] = [0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
+                                   0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8]
+        var data = namespace
+        data.append(contentsOf: Array(name.utf8))
+
+        // Simple hash (FNV-1a inspired) to fill 16 bytes
+        var hash = [UInt8](repeating: 0, count: 16)
+        for (i, byte) in data.enumerated() {
+            hash[i % 16] ^= byte
+            hash[i % 16] &+= byte &* 31
+        }
+        // Set version 5 and variant bits
+        hash[6] = (hash[6] & 0x0F) | 0x50  // version 5
+        hash[8] = (hash[8] & 0x3F) | 0x80  // variant 1
+        self = UUID(uuid: (hash[0], hash[1], hash[2], hash[3],
+                           hash[4], hash[5], hash[6], hash[7],
+                           hash[8], hash[9], hash[10], hash[11],
+                           hash[12], hash[13], hash[14], hash[15]))
     }
 }
 
@@ -2971,7 +3219,7 @@ struct ContentView: View {
 
                 Divider()
 
-                // Generate button
+                // Status
                 HStack {
                     if vm.isGenerating {
                         ProgressView()
@@ -2982,9 +3230,11 @@ struct ContentView: View {
                         .font(.callout)
                         .foregroundColor(vm.statusMessage.contains("Error") ? .red : .secondary)
                         .lineLimit(2)
-
                     Spacer()
+                }
 
+                // Export row 1: AIME + ILPD
+                HStack {
                     Button {
                         let panel = NSSavePanel()
                         panel.allowedContentTypes = [UTType(filenameExtension: "aime") ?? .data]
@@ -3005,26 +3255,64 @@ struct ContentView: View {
                     .disabled(vm.isGenerating)
                     .controlSize(.large)
 
-                    // ILPD export hidden for now
-                    // Button {
-                    //     let panel = NSSavePanel()
-                    //     panel.allowedContentTypes = [UTType(filenameExtension: "ilpd") ?? .data]
-                    //     panel.nameFieldStringValue = "\(vm.cameraID).ilpd"
-                    //     panel.canCreateDirectories = true
-                    //     if panel.runModal() == .OK, let url = panel.url {
-                    //         vm.exportILPD(to: url)
-                    //     }
-                    // } label: {
-                    //     Label("Export .ilpd", systemImage: "doc.text")
-                    //         .font(.headline)
-                    //         .padding(.horizontal, 8)
-                    // }
-                    // .buttonStyle(.borderedProminent)
-                    // .tint(.green)
-                    // .controlSize(.large)
+                    Button {
+                        let panel = NSSavePanel()
+                        panel.allowedContentTypes = [UTType(filenameExtension: "ilpd") ?? .data]
+                        panel.nameFieldStringValue = "\(vm.cameraID).ilpd"
+                        panel.canCreateDirectories = true
+                        if panel.runModal() == .OK, let url = panel.url {
+                            vm.exportILPD(to: url)
+                        }
+                    } label: {
+                        Label("Export .ilpd", systemImage: "doc.text")
+                            .font(.headline)
+                            .padding(.horizontal, 8)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .controlSize(.large)
+
+                    Spacer()
+                }
+
+                // Export row 2: Inject to Video + Flip toggle
+                HStack {
+                    Button {
+                        guard let videoURL = vm.videoURL else { return }
+                        let ext = videoURL.pathExtension.isEmpty ? "mov" : videoURL.pathExtension
+                        let base = videoURL.deletingPathExtension().lastPathComponent
+                        let dir = videoURL.deletingLastPathComponent()
+                        // Auto-name: foo.mov → foo_ilpd.mov, avoid overwriting
+                        var outputURL = dir.appendingPathComponent("\(base)_ilpd.\(ext)")
+                        var counter = 2
+                        while FileManager.default.fileExists(atPath: outputURL.path) {
+                            outputURL = dir.appendingPathComponent("\(base)_ilpd_\(counter).\(ext)")
+                            counter += 1
+                        }
+                        vm.injectILPDToVideo(outputURL: outputURL)
+                    } label: {
+                        Label("Inject ILPD to Video", systemImage: "film.stack")
+                            .font(.headline)
+                            .padding(.horizontal, 8)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .controlSize(.large)
+                    .disabled(vm.videoURL == nil)
+
+                    Toggle("Flip L/R calibration in ILPD", isOn: $vm.flipILPDCalibration)
+                        .font(.caption)
+                        .fixedSize()
+
+                    Spacer()
                 }
             }
             .padding(20)
+            .alert("ILPD Injection", isPresented: $vm.showInjectAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(vm.injectAlertMessage)
+            }
         }
         .frame(minWidth: 420, maxWidth: 520)
 
