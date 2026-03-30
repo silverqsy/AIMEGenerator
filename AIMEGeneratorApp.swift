@@ -830,11 +830,11 @@ class AIMEViewModel: ObservableObject {
             return
         }
 
-        // Find inject_ilpd_v2.py next to the app bundle or in the project dir
+        // Find inject_ilpd_v2.py: check bundle Resources first, then next to app
         let appDir = Bundle.main.bundleURL.deletingLastPathComponent()
         let scriptCandidates = [
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/inject_ilpd_v2.py"),
             appDir.appendingPathComponent("inject_ilpd_v2.py"),
-            appDir.appendingPathComponent("Aime investigate").appendingPathComponent("inject_ilpd_v2.py"),
             URL(fileURLWithPath: "/Users/siyangqi/Downloads/Aime investigate/inject_ilpd_v2.py")
         ]
         guard let scriptURL = scriptCandidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
@@ -2567,10 +2567,11 @@ enum MeiRivesFitter {
 
         // Load the known working ILPD template
         let appParent = Bundle.main.bundleURL.deletingLastPathComponent().path
+        let bundleResources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources").path
         let templatePaths = [
             Bundle.main.path(forResource: "ilpd_template", ofType: "json"),
+            "\(bundleResources)/ilpd_template.json",
             "\(appParent)/ilpd_template.json",
-            "\(appParent)/Aime investigate/ilpd_template.json",
             "/Users/siyangqi/Downloads/Aime investigate/ilpd_template.json"
         ].compactMap { $0 }
 

@@ -12,3 +12,5 @@
 *.xcworkspace/
 build/
 DerivedData/
+AIMEGenerator.dmg
+AIMEGenerator.zip
