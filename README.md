@@ -6,6 +6,7 @@ By Siyang Qi
 
 A macOS tool for creating `.aime` lens profile files and `.ilpd` (Immersive Lens Profile Data) for third-party immersive (VR180 stereo) video on Apple Vision Pro. Also supports injecting ILPD metadata directly into video files for DaVinci Resolve's immersive workflow.
 
+Watch it in action with Canon R5C footage: https://youtu.be/Rp0Gr38slTI?si=uuS5emHi6tiYXz9T
 ## What it does
 
 AIME Generator takes camera calibration data (from Gyroflow or manual input) and generates `.aime` and `.ilpd` files that tell Apple Vision Pro / DaVinci Resolve how to correctly project fisheye video onto the immersive display. It supports:
